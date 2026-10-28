@@ -1,4 +1,6 @@
-// Pasa's own encrypted store. Room keys and plaintext never reach this Worker.
+// Message bodies stay encrypted. Public preview URLs are fetched separately.
+import { getPreview, PreviewError } from './preview.js';
+import { signImage, loadPreviewImage } from './image-proxy.js';
 const ROOM_PATTERN = /^pasa_[a-f0-9]{56}$/;
 const ALLOWED_ORIGINS = new Set([
   'https://ealfaro29.github.io',
@@ -46,7 +48,7 @@ function inspect(request, env) {
   const origin = request.headers.get('Origin');
   if (origin && !ALLOWED_ORIGINS.has(origin)) throw new ApiError(403, 'Origen no permitido');
   const url = new URL(request.url);
-  const match = /^\/api\/rooms\/(pasa_[a-f0-9]{56})\/(messages|ws)$/.exec(url.pathname);
+  const match = /^\/api\/rooms\/(pasa_[a-f0-9]{56})\/(messages|ws|preview|image)$/.exec(url.pathname);
   if (!match || !allowedRooms(env).has(match[1])) throw new ApiError(404, 'Espacio no encontrado');
   return { url, room: match[1], action: match[2] };
 }
@@ -66,7 +68,52 @@ function options(request) {
 }
 
 function failure(request, error) {
-  return json(request, { error: error instanceof ApiError ? error.message : 'Error temporal del servidor' }, error instanceof ApiError ? error.status : 500);
+  const known = error instanceof ApiError || error instanceof PreviewError;
+  return json(request, { error: known ? error.message : 'Error temporal del servidor' }, known ? error.status : 500);
+}
+
+async function preview(request, env, route) {
+  if (request.method !== 'POST') throw new ApiError(405, 'Método no permitido');
+  if (!request.body) throw new ApiError(400, 'Falta el enlace');
+  const reader = request.body.getReader();
+  let size = 0;
+  const parts = [];
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > 8192) { await reader.cancel(); throw new ApiError(413, 'El enlace es demasiado largo'); }
+    parts.push(value);
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const part of parts) { bytes.set(part, offset); offset += part.byteLength; }
+  let body;
+  try { body = JSON.parse(decoder.decode(bytes)); } catch { throw new ApiError(400, 'Enlace no válido'); }
+  if (!body || typeof body.url !== 'string' || body.url.length > 4096) throw new ApiError(400, 'Enlace no válido');
+  const result = await getPreview(body.url);
+  let image = null;
+  if (result.image) {
+    try {
+      const token = await signImage(result.image, route.room, env.PREVIEW_SIGNING_KEY);
+      const imageURL = new URL(`/api/rooms/${route.room}/image`, request.url);
+      imageURL.searchParams.set('token', token);
+      image = imageURL.href;
+    } catch { /* Useful text metadata remains available if the image is rejected. */ }
+  }
+  return json(request, { ...result, url: body.url, image });
+}
+
+async function previewImage(request, env, route) {
+  if (request.method !== 'GET') throw new ApiError(405, 'Método no permitido');
+  const image = await loadPreviewImage(route.url.searchParams.get('token'), route.room, env.PREVIEW_SIGNING_KEY);
+  const headers = headersFor(request);
+  for (const name of ['Content-Type', 'X-Content-Type-Options', 'Content-Security-Policy']) {
+    const value = image.headers.get(name);
+    if (value) headers.set(name, value);
+  }
+  headers.set('Cache-Control', 'private, max-age=86400');
+  return new Response(image.body, { headers });
 }
 
 async function boundedEnvelope(request) {
@@ -144,6 +191,7 @@ export class PasaRoom {
   async fetch(request) {
     try {
       const route = inspect(request, this.env);
+      if (!['messages', 'ws'].includes(route.action)) throw new ApiError(404, 'Ruta no encontrada');
       if (request.method === 'OPTIONS') return options(request);
       if (route.action === 'ws') {
         if (request.method !== 'GET') throw new ApiError(405, 'Método no permitido');
@@ -244,6 +292,8 @@ export default {
       }
       const route = inspect(request, env);
       if (request.method === 'OPTIONS') return options(request);
+      if (route.action === 'preview') return await preview(request, env, route);
+      if (route.action === 'image') return await previewImage(request, env, route);
       if (!['GET', 'POST'].includes(request.method) || (route.action === 'ws' && request.method !== 'GET')) throw new ApiError(405, 'Método no permitido');
       const room = env.ROOMS.get(env.ROOMS.idFromName(route.room));
       return await room.fetch(request);

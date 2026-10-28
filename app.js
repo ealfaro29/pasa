@@ -1,5 +1,6 @@
-import { createRoom, decryptMessage, encryptMessage, isRoomSecret, loadHistory, MAX_TEXT_BYTES, publishEnvelope, subscribe } from './protocol.js?v=2.0.0';
-import { describeLink, extractLinks } from './links.js?v=2.0.0';
+import { createRoom, decryptMessage, encryptMessage, isRoomSecret, loadHistory, MAX_TEXT_BYTES, publishEnvelope, subscribe } from './protocol.js?v=3.0.0';
+import { extractLinks } from './links.js?v=3.0.0';
+import { createLinkCard, setPreviewContext } from './preview-cards.js?v=3.0.0';
 
 const $ = id => document.getElementById(id);
 const input = $('message-input');
@@ -89,33 +90,7 @@ function icon(name) {
 }
 
 function linkCard(url) {
-  const info = describeLink(url);
-  const card = document.createElement('a');
-  card.className = 'link-card';
-  const platform = info.platform.toLowerCase().replace(/^google /, '').replaceAll(' ', '-');
-  card.dataset.platform = platform;
-  card.href = info.url;
-  card.target = '_blank';
-  card.rel = 'noopener noreferrer';
-  card.title = info.url;
-  card.setAttribute('aria-label', `${info.provider}: ${info.title}. Abrir en otra pestaña`);
-  const mark = document.createElement('span');
-  mark.className = 'link-card-icon';
-  mark.setAttribute('aria-hidden', 'true');
-  const marks = { youtube: '▶', github: 'GH', instagram: '◎', x: '𝕏', twitter: '𝕏', tiktok: '♪', notion: 'N', figma: 'F', docs: 'D', sheets: 'S', slides: 'P', drive: '△', canva: 'C', linkedin: 'in', spotify: '≋', wikipedia: 'W' };
-  mark.textContent = marks[platform] || info.provider.slice(0, 1).toUpperCase();
-  const content = document.createElement('span');
-  content.className = 'link-card-content';
-  for (const [name, text] of [['provider', info.provider], ['title', info.title], ['domain', info.domain]]) {
-    const line = document.createElement('span');
-    line.className = `link-card-${name}`;
-    line.textContent = text;
-    content.append(line);
-  }
-  const arrow = icon('arrow');
-  arrow.classList.add('link-card-arrow');
-  card.append(mark, content, arrow);
-  return card;
+  return createLinkCard(url);
 }
 
 function renderRecord(record, fresh) {
@@ -607,6 +582,7 @@ async function init() {
   }
   storage.set('pasa.lastRoom.v1', secret);
   room = await createRoom(secret);
+  setPreviewContext(room.topic);
   storageKey = `pasa.history.v1.${room.topic}`;
   const raw = storage.get(storageKey);
   let saved;

@@ -1,17 +1,20 @@
 {
   "name": "pasa",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "private": true,
   "type": "module",
   "description": "Texto y links entre tus PCs, en un mismo enlace",
   "scripts": {
     "dev": "python3 -m http.server 4173 --bind 127.0.0.1",
     "test": "node --test tests/*.test.js",
-    "check": "node --check app.js && node --check protocol.js && node --check links.js && node --check config.js && node --check backend/worker.js",
+    "check": "node --check app.js && node --check protocol.js && node --check links.js && node --check config.js && node --check backend/worker.js && node --check preview-cards.js && node --check backend/preview.js && node --check backend/image-proxy.js",
     "dev:backend": "wrangler dev --config backend/wrangler.jsonc --port 8787",
     "deploy:backend": "wrangler deploy --config backend/wrangler.jsonc"
   },
   "devDependencies": {
     "wrangler": "^4.153.0"
+  },
+  "dependencies": {
+    "htmlparser2": "^12.0.0"
   }
 }

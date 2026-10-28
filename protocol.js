@@ -1,5 +1,5 @@
-// The owned backend receives only ciphertext. The key stays in the URL fragment.
-import { API_ORIGIN } from './config.js?v=2.0.0';
+// Message transport sends ciphertext. The key stays in the URL fragment.
+import { API_ORIGIN } from './config.js?v=3.0.0';
 export const MAX_TEXT_BYTES = 128 * 1024;
 // JSON can expand control characters to six bytes each before compression.
 const MAX_JSON_BYTES = MAX_TEXT_BYTES * 6 + 2048;

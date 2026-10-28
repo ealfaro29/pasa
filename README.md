@@ -20,8 +20,8 @@ La dirección base recupera el último espacio usado en ese navegador. En un nav
 - Sincronización en tiempo real y recuperación de mensajes mientras el otro equipo está cerrado.
 - Historial persistente sin caducidad automática ni contador diario de envíos en la app.
 - Paginación para recorrer conversaciones largas sin descargar todo el historial al abrir.
-- Tarjetas locales para YouTube, GitHub, X, Instagram, TikTok, Notion, Figma, Google Docs/Sheets/Slides/Drive, Canva, LinkedIn, Spotify y Wikipedia.
-- El reconocimiento de tarjetas usa la URL para identificar plataforma y tipo de contenido; no consulta servicios externos de metadatos.
+- Tarjetas con foto, título y descripción para productos de Amazon, artículos y páginas públicas; reconocimiento de YouTube, GitHub, X, Instagram, TikTok, Notion, Figma, Google Docs/Sheets/Slides/Drive, Canva, LinkedIn, Spotify y Wikipedia.
+- Las vistas previas las obtiene nuestro propio backend desde la página original: Open Graph, Twitter Cards, datos estructurados y, en Amazon, la imagen y el título del producto. Los precios solo se muestran si aparecen en los datos de la página. Si la web impide la consulta, se conserva una tarjeta de enlace limpia.
 - AES-256-GCM en el navegador antes de enviar. La clave de cifrado permanece en el fragmento `#`, que no se incluye en las peticiones al servidor.
 - Historial y borrador locales cifrados, deduplicación, recuperación de conexión y reintentos acotados.
 - Hasta 128 KiB de texto por envío, con compresión cuando está disponible y un límite técnico de tamaño para proteger los recursos del servidor.
@@ -37,7 +37,7 @@ El navegador mantiene una caché de hasta 100 mensajes y unos 3 MB para abrir r�
 
 **Limpiar** en Output oculta el historial solo en ese navegador. No borra el servidor ni los otros equipos. **Ver historial guardado** permite volver a mostrarlo. Los envíos pendientes y fallidos se conservan para reintentar. Si borras los datos del navegador, abre el enlace completo guardado en favoritos para entrar al mismo espacio.
 
-El servidor guarda únicamente sobres cifrados y acepta solo espacios autorizados. El enlace completo permite leer y enviar en su espacio: mantenlo privado. No hay analítica, scripts de terceros ni servicios externos de vistas previas. Los enlaces externos se abren con `noopener noreferrer`.
+El historial se almacena cifrado y acepta solo espacios autorizados. Para crear vistas previas, el navegador envía separadamente al backend la URL pública del enlace; nuestro servidor consulta esa página y sirve su imagen mediante un proxy firmado. El resto del mensaje sigue cifrado. El enlace completo permite leer y enviar en su espacio: mantenlo privado. No hay analítica, scripts de terceros ni servicios externos de vistas previas. Los enlaces privados, las credenciales en URLs y los destinos de red local no se consultan. Los enlaces externos se abren con `noopener noreferrer`.
 
 ## Desarrollo
 
@@ -51,4 +51,4 @@ npm test
 
 Abre http://127.0.0.1:4173 con el fragmento de un espacio autorizado. Para probar dos navegadores con almacenamiento independiente, abre el mismo fragmento en `http://localhost:4173`.
 
-GitHub Pages publica la raíz de `main`. El backend se despliega por separado con Wrangler y su configuración `backend/wrangler.jsonc`. `ROOM_IDS` es un secreto de despliegue con la lista de identificadores de espacios permitidos, separados por comas. No se deben incluir claves de conexión, tokens ni datos privados en el repositorio.
+GitHub Pages publica la raíz de `main`. El backend se despliega por separado con Wrangler y su configuración `backend/wrangler.jsonc`. `PREVIEW_SIGNING_KEY` firma el acceso a imágenes públicas de las tarjetas; se mantiene como secreto en el Worker. `ROOM_IDS` es un secreto de despliegue con la lista de identificadores de espacios permitidos, separados por comas. No se deben incluir claves de conexión, tokens ni datos privados en el repositorio.

@@ -112,6 +112,22 @@ test('preflight and unsupported methods are rejected before durable-object routi
   assert.equal(app.routed(), 0);
 });
 
+test('preview routes enforce room access, bounded input and signed images before any page fetch', async t => {
+  const app = setup(); t.after(() => app.db.close());
+  const unknown = new Request(`https://pasa-api.example/api/rooms/${OTHER_ROOM}/preview`, {
+    method: 'POST', body: JSON.stringify({ url: 'https://example.com/' }),
+  });
+  assert.equal((await worker.fetch(unknown, app.env)).status, 404);
+  assert.equal((await worker.fetch(request('preview'), app.env)).status, 405);
+  assert.equal((await worker.fetch(request('image'), app.env)).status, 400);
+  assert.equal((await worker.fetch(request('preview', { method: 'POST', body: 'x'.repeat(9000) }), app.env)).status, 413);
+  for (const url of ['https://127.0.0.1/admin', 'https://localhost/', 'https://example.com/?token=private']) {
+    const response = await worker.fetch(request('preview', { method: 'POST', body: JSON.stringify({ url }) }), app.env);
+    assert.equal(response.status, 400);
+  }
+  assert.equal(app.routed(), 0, 'public metadata never enters the encrypted history store');
+});
+
 test('publish stores encrypted envelopes durably, broadcasts once and deduplicates retries', async t => {
   const app = setup(); t.after(() => app.db.close());
   const body = envelope();

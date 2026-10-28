@@ -62,6 +62,29 @@ test('recognizes GitHub repository, issue and pull request context', () => {
   assert.equal(describeLink('https://github.com/ealfaro29/pasa/pull/7').kind, 'pull');
 });
 
+test('recognizes Amazon regional products and short links while keeping the original URL', () => {
+  for (const url of [
+    'https://www.amazon.com/dp/B0D2SW14ZN?tag=example-20',
+    'https://amazon.com.mx/gp/product/B012345678',
+    'https://amazon.co.uk/gp/aw/d/B012345678',
+    'https://amazon.co.jp/dp/B012345678',
+    'https://amazon.com.au/dp/B012345678',
+    'https://www.amazon.es/dp/B012345678',
+    'https://amzn.to/abc123',
+    'https://a.co/d/abc123',
+  ]) {
+    const result = describeLink(url);
+    assert.equal(result.platform, 'Amazon');
+    assert.equal(result.kind, 'product');
+    assert.equal(result.url, url);
+    assert.equal(result.title, 'Producto de Amazon');
+  }
+  assert.equal(describeLink('https://www.amazon.com/Logitech-MX-Master-Wireless-Mouse/dp/B012345678').title, 'Logitech MX Master Wireless Mouse');
+  for (const url of ['https://amazon.com.evil.test/dp/B012345678', 'https://notamazon.com/dp/B012345678', 'https://example.com/?url=https://amazon.com/dp/B012345678']) {
+    assert.equal(describeLink(url).platform, 'Web');
+  }
+});
+
 test('recognizes social publication and profile paths', () => {
   for (const [url, platform, kind] of [
     ['https://x.com/alfa/status/123', 'X', 'post'], ['https://twitter.com/alfa', 'X', 'profile'],

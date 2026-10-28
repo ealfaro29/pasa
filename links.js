@@ -4,7 +4,7 @@ const COLORS = {
   web: '#7c8a96', youtube: '#ff5252', github: '#c9d1d9', x: '#b8c3cd',
   instagram: '#f16faa', tiktok: '#58e3dc', notion: '#d8dee3', figma: '#ae8aff',
   google: '#79a8ff', canva: '#46d3d7', linkedin: '#65a9ee', spotify: '#54d88b',
-  wikipedia: '#c7cdd2',
+  wikipedia: '#c7cdd2', amazon: '#f4a340',
 };
 
 function parseSafeUrl(value) {
@@ -97,6 +97,13 @@ export function describeLink(href) {
     url: href, platform, provider: platform, title, domain, kind, color,
   });
   const person = value => cleanTitle(value).replace(/^@/, '');
+
+  const amazon = /(?:^|\.)amazon\.(?:com|ca|com\.mx|com\.br|co\.uk|de|fr|es|it|nl|se|pl|ie|com\.be|com\.tr|ae|sa|eg|in|co\.jp|com\.au|sg|co\.za)$/.test(domain);
+  if (amazon || domain === 'amzn.to' || domain === 'a.co') {
+    const product = /\/(?:dp|gp\/product|gp\/aw\/d)\/([A-Z0-9]{10})(?:[/?]|$)/i.test(parsed.pathname);
+    const slug = amazon && product && !['dp', 'gp'].includes(first) ? cleanTitle(parts[0]) : '';
+    return label('Amazon', slug || 'Producto de Amazon', 'product', COLORS.amazon);
+  }
 
   if (is('youtube.com') || domain === 'youtu.be') {
     if (first === 'shorts') return label('YouTube', 'Short de YouTube', 'short', COLORS.youtube);
