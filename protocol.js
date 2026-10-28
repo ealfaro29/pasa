@@ -1,11 +1,9 @@
-// The relay receives only ciphertext. The room key stays in the URL fragment.
-export const RELAY = 'https://ntfy.sh';
-export const HISTORY_MS = 12 * 60 * 60 * 1000;
+// The owned backend receives only ciphertext. The key stays in the URL fragment.
+import { API_ORIGIN } from './config.js?v=2.0.0';
 export const MAX_TEXT_BYTES = 128 * 1024;
 // JSON can expand control characters to six bytes each before compression.
 const MAX_JSON_BYTES = MAX_TEXT_BYTES * 6 + 2048;
 export const MAX_ENVELOPE_BYTES = Math.ceil((MAX_JSON_BYTES + 16) * 4 / 3) + 128;
-export const INLINE_BYTES = 4096;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8', { fatal: true });
 
@@ -98,127 +96,159 @@ export async function decryptMessage(key, envelope) {
 }
 
 export class RelayError extends Error {
-  constructor(message, retryable = false, retryAfter = 0) {
+  constructor(message, retryable = false, retryAfter = 0, status = 0) {
     super(message);
     this.name = 'RelayError';
     this.retryable = retryable;
     this.retryAfter = retryAfter;
+    this.status = status;
+  }
+}
+
+function roomURL(topic, suffix) {
+  if (!/^pasa_[a-f0-9]{56}$/.test(topic)) throw new RelayError('El enlace de conexión no es válido.');
+  return `${API_ORIGIN}/api/rooms/${topic}/${suffix}`;
+}
+
+function backendEvent(event) {
+  return event?.event === 'message' && Number.isSafeInteger(event.seq) && event.seq > 0 &&
+    event.id === String(event.seq) && typeof event.message === 'string' && event.message.length <= MAX_ENVELOPE_BYTES;
+}
+
+async function boundedJSON(response) {
+  const reader = response.body?.getReader();
+  if (!reader) throw new RelayError('No se pudo leer la respuesta del servidor.', true);
+  const parts = [];
+  let size = 0;
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    size += value.length;
+    if (size > 4 * 1024 * 1024) {
+      await reader.cancel();
+      throw new RelayError('La respuesta del servidor es demasiado grande.', true);
+    }
+    parts.push(value);
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const part of parts) { bytes.set(part, offset); offset += part.length; }
+  return JSON.parse(decoder.decode(bytes));
+}
+
+async function requestJSON(url, options, fetcher) {
+  let response;
+  try {
+    response = await fetcher(url, {
+      ...options,
+      credentials: 'omit',
+      referrerPolicy: 'no-referrer',
+      cache: 'no-store',
+      signal: AbortSignal.timeout(25000),
+    });
+  } catch { throw new RelayError('No se pudo conectar. Revisa la conexión e inténtalo otra vez.', true); }
+  if (!response.ok) {
+    const status = response.status;
+    const messages = {
+      404: 'Este espacio no existe. Abre tu enlace privado completo en ambos PCs.',
+      413: 'El texto es demasiado grande para este envío.',
+      429: 'El servidor está temporalmente ocupado. Inténtalo de nuevo.',
+    };
+    throw new RelayError(messages[status] || 'El servidor no pudo completar la operación.', status >= 500 || status === 429, 0, status);
+  }
+  try { return await boundedJSON(response); }
+  catch (error) {
+    if (error instanceof RelayError) throw error;
+    throw new RelayError('No se pudo confirmar la respuesta del servidor.', true);
   }
 }
 
 export async function publishEnvelope(topic, envelope, fetcher = fetch) {
-  const attachment = encoder.encode(envelope).length > INLINE_BYTES;
-  let response;
-  try {
-    response = await fetcher(`${RELAY}/${topic}`, {
-      method: 'POST',
-      headers: attachment ? { 'Content-Type': 'text/plain', Filename: 'pasa.enc' } : { 'Content-Type': 'text/plain' },
-      body: envelope,
-      credentials: 'omit',
-      referrerPolicy: 'no-referrer',
-      signal: AbortSignal.timeout(25000),
-    });
-  } catch { throw new RelayError('No se pudo enviar. Revisa la conexión e inténtalo otra vez.', true); }
-  if (!response.ok) {
-    if (response.status === 429) {
-      const retryAfter = Math.max(60000, Math.min(86400000, (Number(response.headers.get('Retry-After')) || 60) * 1000));
-      throw new RelayError('Límite temporal del servicio. Espera un momento para reintentar.', false, retryAfter);
-    }
-    throw new RelayError(response.status >= 500 ? 'El servicio está temporalmente ocupado.' : 'El servicio no pudo aceptar este texto.', response.status >= 500);
-  }
-  let event;
-  try { event = await response.json(); }
-  catch { throw new RelayError('No se pudo confirmar el envío.', true); }
-  if (event.event !== 'message' || typeof event.id !== 'string') throw new RelayError('No se pudo confirmar el envío.', true);
+  if (typeof envelope !== 'string' || envelope.length > MAX_ENVELOPE_BYTES) throw new RelayError('El texto es demasiado grande.');
+  const event = await requestJSON(roomURL(topic, 'messages'), {
+    method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: envelope,
+  }, fetcher);
+  if (!backendEvent(event)) throw new RelayError('No se pudo confirmar el envío.', true);
   return event;
 }
 
-export async function envelopeFromEvent(event, fetcher = fetch) {
-  try { return await readEnvelopeFromEvent(event, fetcher); }
-  catch (error) {
-    if (error instanceof RelayError) throw error;
-    throw new RelayError('No se pudo descargar el texto largo. Reintentando la conexión.', true);
-  }
+export async function envelopeFromEvent(event) {
+  return backendEvent(event) ? event.message : null;
 }
 
-async function readEnvelopeFromEvent(event, fetcher) {
-  if (!event || event.event !== 'message') return null;
-  if (!event.attachment) {
-    if (typeof event.message !== 'string' || event.message.length > INLINE_BYTES) return null;
-    return event.message;
+export async function loadHistory(topic, { before, after, limit = 30 } = {}, fetcher = fetch) {
+  const url = new URL(roomURL(topic, 'messages'));
+  if (before !== undefined && after !== undefined) throw new RelayError('Cursor de historial no válido.');
+  for (const [name, value] of [['before', before], ['after', after]]) {
+    if (value === undefined) continue;
+    if (!Number.isSafeInteger(value) || value < 0 || (name === 'before' && value === 0)) throw new RelayError('Cursor de historial no válido.');
+    url.searchParams.set(name, String(value));
   }
-  const file = event.attachment;
-  if (file.name !== 'pasa.enc' || !Number.isFinite(file.size) || file.size > MAX_ENVELOPE_BYTES || file.size < 1) return null;
-  let url;
-  try { url = new URL(file.url); } catch { return null; }
-  if (url.origin !== RELAY || !/^\/file\/[a-zA-Z0-9._-]+$/.test(url.pathname) || url.username || url.password || url.search) return null;
-  if (file.expires * 1000 <= Date.now()) throw new RelayError('Este texto largo ya expiró. Vuelve a enviarlo desde el otro PC.');
-  const response = await fetcher(url.href, { credentials: 'omit', referrerPolicy: 'no-referrer', signal: AbortSignal.timeout(20000) });
-  if (!response.ok) throw new RelayError(response.status === 404 ? 'Este texto largo ya expiró.' : 'No se pudo descargar el texto largo.', response.status !== 404);
-  const declared = Number(response.headers.get('Content-Length'));
-  if (declared > MAX_ENVELOPE_BYTES) return null;
-  const reader = response.body.getReader();
-  const parts = [];
-  let length = 0;
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    length += value.length;
-    if (length > MAX_ENVELOPE_BYTES) { await reader.cancel(); return null; }
-    parts.push(value);
+  url.searchParams.set('limit', String(Math.max(1, Math.min(50, Math.floor(limit) || 30))));
+  const page = await requestJSON(url.href, { method: 'GET' }, fetcher);
+  if (!page || !Array.isArray(page.messages) || page.messages.length > 50 || !page.messages.every(backendEvent) ||
+    !Number.isSafeInteger(page.latestSeq) || page.latestSeq < 0 || typeof page.hasMore !== 'boolean') {
+    throw new RelayError('El historial recibido no es válido.', true);
   }
-  const bytes = new Uint8Array(length);
-  let offset = 0;
-  for (const part of parts) { bytes.set(part, offset); offset += part.length; }
-  return decoder.decode(bytes);
+  return page;
 }
 
-// A fresh cursor with a small overlap recovers interrupted connections without gaps.
-// De-duplication is based on the authenticated message ID, not the relay ID.
-export function subscribe(topic, { onEvent, onStatus }, makeSocket = url => new WebSocket(url)) {
+// WebSockets carry only live updates. onSync triggers gap recovery over paginated HTTP.
+// The backend auto-replies to ping while its SQLite room is hibernating.
+export function subscribe(topic, { onEvent, onStatus, onSync = () => {} }, makeSocket = url => new WebSocket(url)) {
+  const socketURL = roomURL(topic, 'ws').replace(/^http/, 'ws');
   let socket;
   let timer;
   let watchdog;
+  let heartbeat;
   let failures = 0;
   let closed = false;
-  let lastTime = 0;
-  function connect() {
-    if (closed) return;
+  function clearTimers() {
     clearTimeout(timer);
     clearTimeout(watchdog);
+    clearInterval(heartbeat);
+  }
+  function connect() {
+    if (closed) return;
+    clearTimers();
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
       onStatus('offline');
       timer = setTimeout(connect, 15000);
       return;
     }
     onStatus(failures ? 'reconnecting' : 'connecting');
-    const since = lastTime ? Math.max(0, lastTime - 5) : 'all';
-    socket = makeSocket(`wss://ntfy.sh/${topic}/ws?since=${since}`);
+    socket = makeSocket(socketURL);
     const active = socket;
     const arm = () => {
       clearTimeout(watchdog);
-      watchdog = setTimeout(() => { if (active === socket) active.close(); }, 65000);
+      watchdog = setTimeout(() => { if (active === socket) active.close(); }, 70000);
     };
     arm();
+    active.onopen = () => {
+      if (active !== socket || closed) return;
+      clearInterval(heartbeat);
+      heartbeat = setInterval(() => {
+        if (active === socket && active.readyState === 1) {
+          try { active.send('ping'); } catch { active.close(); }
+        }
+      }, 25000);
+    };
     active.onmessage = event => {
       if (active !== socket || closed) return;
       arm();
-      try {
-        const value = JSON.parse(event.data);
-        if (value.event === 'open' || value.event === 'keepalive') {
-          failures = 0;
-          onStatus('connected');
-        }
-        if (value.event === 'message') {
-          if (Number.isFinite(value.time)) lastTime = Math.max(lastTime, Math.min(value.time, Math.floor(Date.now() / 1000)));
-          onEvent(value);
-        }
-      } catch { /* Ignore malformed relay events. */ }
+      if (event.data === 'pong') return;
+      let value;
+      try { value = JSON.parse(event.data); } catch { return; }
+      if (value.event === 'open' && Number.isSafeInteger(value.latestSeq) && value.latestSeq >= 0) {
+        failures = 0;
+        onStatus('connected');
+        onSync(value.latestSeq);
+      } else if (backendEvent(value)) onEvent(value);
     };
     active.onerror = () => active.close();
     active.onclose = () => {
       if (active !== socket || closed) return;
-      clearTimeout(watchdog);
+      clearTimers();
       failures += 1;
       onStatus(typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'reconnecting');
       timer = setTimeout(connect, Math.min(30000, 1000 * 2 ** Math.min(failures, 5)) + Math.random() * 500);
@@ -233,8 +263,7 @@ export function subscribe(topic, { onEvent, onStatus }, makeSocket = url => new 
     },
     close() {
       closed = true;
-      clearTimeout(timer);
-      clearTimeout(watchdog);
+      clearTimers();
       socket?.close();
     },
   };

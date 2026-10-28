@@ -5,12 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#f5f5f0" />
     <meta name="referrer" content="no-referrer" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' https://ntfy.sh wss://ntfy.sh; img-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'self'" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' https://pasa-api.sentient-proposal-comments.workers.dev wss://pasa-api.sentient-proposal-comments.workers.dev http://127.0.0.1:8787 ws://127.0.0.1:8787; img-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'self'" />
     <meta name="description" content="Pega texto y links en un PC y recíbelos en el otro. Un mismo enlace, sin registro." />
     <title>pasa — De un PC al otro</title>
     <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="./styles.css" />
-    <script type="module" src="./app.js"></script>
+    <link rel="stylesheet" href="./styles.css?v=2.0.0" />
+    <script type="module" src="./app.js?v=2.0.0"></script>
   </head>
   <body>
     <noscript><p class="noscript-message">Activa JavaScript para conectar tus PCs y compartir texto y links.</p></noscript>
@@ -63,7 +63,7 @@
             </div>
             <form id="send-form" class="input-form">
               <label for="message-input" class="sr-only">Texto o links para compartir</label>
-              <textarea id="message-input" name="message" maxlength="100000" spellcheck="false" placeholder="Ese link, esa idea, ese texto…&#10;Pégalo aquí." autocomplete="off" autocapitalize="off" aria-describedby="input-hint"></textarea>
+              <textarea id="message-input" name="message" spellcheck="false" placeholder="Ese link, esa idea, ese texto…&#10;Pégalo aquí." autocomplete="off" autocapitalize="off" aria-describedby="input-hint"></textarea>
               <p id="input-hint" class="input-hint" role="status" aria-live="polite"></p>
               <div class="input-details">
                 <label class="auto-send-toggle"><input id="auto-send" type="checkbox" checked /><span>Enviar al pegar</span></label>
@@ -91,12 +91,15 @@
                 <span class="empty-shortcut">Pegar <svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg> Enviar <svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg> Copiar</span>
               </div>
             </div>
+            <div id="history-tools" class="history-tools" hidden>
+              <button id="load-older" class="text-button" type="button" aria-controls="output-list" hidden>Cargar anteriores</button>
+            </div>
           </section>
         </div>
 
         <footer class="app-footer">
           <span><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="12" rx="2"/><path d="M8 21h8m-4-4v4"/></svg>Mismo enlace en los dos PCs</span>
-          <div class="footer-security"><span><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3m-4 5v2"/></svg>Cifrado de extremo a extremo</span><details class="service-info"><summary>Cómo funciona</summary><div class="service-info-content">El historial se guarda en este navegador durante 12 horas. El servicio ntfy permite hasta 250 envíos al día; los mensajes normales están disponibles 12 horas y los textos largos, 3 horas. Mantén privado tu enlace.</div></details></div>
+          <div class="footer-security"><span><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3m-4 5v2"/></svg>Cifrado de extremo a extremo</span><details class="service-info"><summary>Cómo funciona</summary><div class="service-info-content">Pasa usa un servidor propio y una base de datos persistente. El historial no caduca y la app no aplica una cuota diaria de envíos. El enlace es tu acceso: guárdalo en favoritos y úsalo en ambos PCs. Limpiar oculta el historial solo en este navegador.</div></details></div>
         </footer>
       </main>
       <div class="bottom-note">Menos enviártelo por chat. Más seguir con lo tuyo.</div>
@@ -111,6 +114,19 @@
       <input id="room-link" type="url" readonly spellcheck="false" />
       <button id="copy-room-link" class="button button-primary dialog-copy" type="button"><svg class="icon" aria-hidden="true"><use href="#icon-copy"/></svg><span>Copiar enlace</span></button>
       <p class="dialog-privacy">El enlace da acceso a este espacio. Compártelo solo entre tus equipos.</p>
+    </dialog>
+    <dialog id="join-dialog" class="room-dialog join-dialog" aria-labelledby="join-title">
+      <form method="dialog"><button class="dialog-close" type="submit" aria-label="Cerrar"><svg class="icon" aria-hidden="true"><use href="#icon-close"/></svg></button></form>
+      <div class="dialog-link-icon" aria-hidden="true"><svg class="icon"><use href="#icon-link"/></svg></div>
+      <h2 id="join-title">Entra a tu espacio.</h2>
+      <p>Abre tu enlace privado de Pasa o pégalo aquí. Usa el mismo en los dos equipos.</p>
+      <form id="join-form">
+        <label for="connection-link">Tu enlace de conexión</label>
+        <input id="connection-link" name="connection" type="text" autocomplete="off" spellcheck="false" placeholder="Pega tu enlace completo" required />
+        <p id="join-error" class="join-error" role="alert"></p>
+        <button class="button button-primary dialog-copy" type="submit"><span>Conectar este PC</span><svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button>
+      </form>
+      <p class="dialog-privacy">En el otro equipo, pulsa Conectar otro PC para copiarlo.</p>
     </dialog>
     <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
   </body>

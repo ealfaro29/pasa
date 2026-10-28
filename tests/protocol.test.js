@@ -1,23 +1,25 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  RELAY, MAX_TEXT_BYTES, MAX_ENVELOPE_BYTES, INLINE_BYTES,
+  MAX_TEXT_BYTES, MAX_ENVELOPE_BYTES,
   toBase64, fromBase64, newSecret, isRoomSecret, createRoom,
   validateMessage, encryptMessage, decryptMessage, publishEnvelope,
-  envelopeFromEvent, RelayError, subscribe,
+  envelopeFromEvent, RelayError, subscribe, loadHistory,
 } from '../protocol.js';
+import { API_ORIGIN } from '../config.js';
 
 const encoder = new TextEncoder();
 const message = (text, extra = {}) => ({
   v: 1, id: crypto.randomUUID(), device: crypto.randomUUID(),
   text, created: Date.now(), ...extra,
 });
-const ack = () => new Response(JSON.stringify({ event: 'message', id: 'relayMessage01' }), { status: 200 });
-const attachmentEvent = (extra = {}) => ({
-  event: 'message', message: 'You received a file',
-  attachment: { name: 'pasa.enc', size: 20, expires: Math.floor(Date.now() / 1000) + 3600,
-    url: `${RELAY}/file/message_01.txt`, ...extra },
+const topic = 'pasa_' + 'a'.repeat(56);
+const event = (seq = 1, text = 'ciphertext') => ({
+  event: 'message', id: String(seq), seq,
+  time: 1700000000, message: text,
 });
+const ack = (seq = 1) => new Response(JSON.stringify(event(seq)), { status: 200 });
+const page = (extra = {}) => ({ messages: [event(2), event(1)], latestSeq: 2, hasMore: false, nextBefore: 1, ...extra });
 
 async function sealRaw(key, payload) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -177,162 +179,233 @@ test('enforces UTF-8 text byte limits, meaningful content, identifiers and times
   await assert.rejects(decryptMessage(key, await sealRaw(key, future)), /Mensaje inválido/);
 });
 
-test('returns only inline message events within the inline size boundary', async () => {
-  const noFetch = () => assert.fail('Inline content must not trigger a fetch');
-  assert.equal(await envelopeFromEvent({ event: 'open', message: 'ignored' }, noFetch), null);
-  assert.equal(await envelopeFromEvent(null, noFetch), null);
-  assert.equal(await envelopeFromEvent({ event: 'message', message: 'abc' }, noFetch), 'abc');
-  assert.equal(await envelopeFromEvent({ event: 'message', message: 'a'.repeat(INLINE_BYTES) }, noFetch), 'a'.repeat(INLINE_BYTES));
-  assert.equal(await envelopeFromEvent({ event: 'message', message: 'a'.repeat(INLINE_BYTES + 1) }, noFetch), null);
+test('accepts old authenticated messages without a history expiration policy', async () => {
+  const room = await createRoom(newSecret());
+  const original = message('Historial persistente', { created: Date.now() - 365 * 24 * 3600_000 });
+  assert.deepEqual(await decryptMessage(room.key, await encryptMessage(room.key, original)), original);
 });
 
-test('accepts bounded encrypted attachments from the relay with privacy-preserving fetch options', async () => {
-  const envelope = '{"v":1,"iv":"test"}';
-  let request;
-  const result = await envelopeFromEvent(attachmentEvent({ size: envelope.length }), async (url, options) => {
-    request = { url, options };
-    return new Response(envelope, { headers: { 'Content-Length': String(envelope.length) } });
-  });
-  assert.equal(result, envelope);
-  assert.equal(request.url, `${RELAY}/file/message_01.txt`);
-  assert.equal(request.options.credentials, 'omit');
-  assert.equal(request.options.referrerPolicy, 'no-referrer');
-  assert.ok(request.options.signal instanceof AbortSignal);
+test('extracts only bounded authenticated-protocol event envelopes without external downloads', async () => {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
+  Object.defineProperty(globalThis, 'fetch', { value: () => assert.fail('Envelope extraction must never fetch external files'), configurable: true });
+  try {
+    assert.equal(await envelopeFromEvent(event(1)), 'ciphertext');
+    assert.equal(await envelopeFromEvent(event(2, 'a'.repeat(MAX_ENVELOPE_BYTES))), 'a'.repeat(MAX_ENVELOPE_BYTES));
+    const invalid = [null, { event: 'open', latestSeq: 1 }, { event: 'message', message: 'old relay shape' },
+      event(0), event(-1), event(1.5), { ...event(1), id: 'different' },
+      { ...event(1), message: 12 }, event(1, 'a'.repeat(MAX_ENVELOPE_BYTES + 1)),
+      { event: 'message', attachment: { url: 'https://untrusted.example/private' } },
+    ];
+    for (const value of invalid) assert.equal(await envelopeFromEvent(value), null);
+  } finally {
+    if (descriptor) Object.defineProperty(globalThis, 'fetch', descriptor);
+    else delete globalThis.fetch;
+  }
 });
 
-test('rejects untrusted attachment URLs and impossible sizes before making a request', async () => {
-  const noFetch = () => assert.fail('Untrusted metadata must never initiate a request');
-  const invalid = [
-    { url: 'http://ntfy.sh/file/message.txt' },
-    { url: 'https://evil.example/file/message.txt' },
-    { url: 'https://ntfy.sh.evil.example/file/message.txt' },
-    { url: 'https://ntfy.sh:444/file/message.txt' },
-    { url: 'https://user:secret@ntfy.sh/file/message.txt' },
-    { url: 'https://ntfy.sh/file/message.txt?redirect=evil' },
-    { url: 'https://ntfy.sh/v1/account' },
-    { url: 'https://ntfy.sh/file/../account' },
-    { url: 'https://ntfy.sh/file/message%2fother' },
-    { name: 'different.txt' }, { size: 0 }, { size: -1 },
-    { size: Number.NaN }, { size: Infinity }, { size: MAX_ENVELOPE_BYTES + 1 },
-  ];
-  for (const metadata of invalid) assert.equal(await envelopeFromEvent(attachmentEvent(metadata), noFetch), null);
+test('rejects invalid room identifiers before initiating any transport request', async () => {
+  const noFetch = () => assert.fail('Invalid room must not contact a backend');
+  for (const invalid of ['', 'pasa_test', '../room', 'pasa_' + 'a'.repeat(55), 'pasa_' + 'A'.repeat(56), null]) {
+    await assert.rejects(publishEnvelope(invalid, 'ciphertext', noFetch), /enlace/);
+    await assert.rejects(loadHistory(invalid, {}, noFetch), /enlace/);
+    let invalidConnection;
+    try {
+      assert.throws(() => { invalidConnection = subscribe(invalid, { onEvent() {}, onStatus() {} }, noFetch); }, /enlace/);
+    } finally { invalidConnection?.close(); }
+  }
 });
 
-test('reports attachment expiration without downloading stale ciphertext', async () => {
-  const noFetch = () => assert.fail('Expired metadata must never initiate a request');
-  await assert.rejects(envelopeFromEvent(attachmentEvent({ expires: Math.floor(Date.now() / 1000) - 1 }), noFetch), error => {
-    assert.ok(error instanceof RelayError);
-    assert.equal(error.retryable, false);
-    assert.match(error.message, /expiró/);
-    return true;
-  });
-  await assert.rejects(envelopeFromEvent(attachmentEvent(), async () => new Response('', { status: 404 })), /expiró/);
-});
-
-test('bounds actual streamed attachment bytes even when the server understates its size', async () => {
-  const oversized = new Uint8Array(MAX_ENVELOPE_BYTES + 1).fill(97);
-  assert.equal(await envelopeFromEvent(attachmentEvent(), async () => new Response(oversized, { headers: { 'Content-Length': '1' } })), null);
-  assert.equal(await envelopeFromEvent(attachmentEvent(), async () => new Response('small', { headers: { 'Content-Length': String(MAX_ENVELOPE_BYTES + 1) } })), null);
-});
-
-test('normalizes failed attachment fetches and interrupted streams as retryable RelayErrors', async () => {
-  const retryableRelayError = error => {
-    assert.ok(error instanceof RelayError);
-    assert.equal(error.name, 'RelayError');
-    assert.equal(error.retryable, true);
-    return true;
-  };
-  await assert.rejects(envelopeFromEvent(attachmentEvent(), async () => {
-    throw new TypeError('Failed to fetch');
-  }), retryableRelayError);
-  await assert.rejects(envelopeFromEvent(attachmentEvent(), async () => new Response(new ReadableStream({
-    start(controller) {
-      controller.enqueue(encoder.encode('{"partial":'));
-      controller.error(new TypeError('Connection interrupted'));
-    },
-  }))), retryableRelayError);
-});
-
-test('publishes at the inline byte threshold and uses one attachment above it', async () => {
+test('publishes each ciphertext directly to the owned API without attachments or cookies', async () => {
   const calls = [];
-  const fetcher = async (url, options) => { calls.push({ url, options }); return ack(); };
-  const inline = 'a'.repeat(INLINE_BYTES);
-  await publishEnvelope('pasa_test', inline, fetcher);
-  await publishEnvelope('pasa_test', inline + 'b', fetcher);
-  await publishEnvelope('pasa_test', '🙂'.repeat(INLINE_BYTES / 4 + 1), fetcher);
-  assert.equal(calls.length, 3, 'one relay publish per clipboard item');
-  assert.equal(calls[0].url, `${RELAY}/pasa_test`);
-  assert.equal(calls[0].options.body, inline);
-  assert.equal(calls[0].options.headers.Filename, undefined);
-  assert.equal(calls[1].options.headers.Filename, 'pasa.enc');
-  assert.equal(calls[2].options.headers.Filename, 'pasa.enc', 'threshold uses UTF-8 bytes');
+  const payload = 'a'.repeat(20000);
+  const result = await publishEnvelope(topic, payload, async (url, options) => {
+    calls.push({ url, options });
+    return ack(7);
+  });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(result, event(7));
+  assert.equal(calls[0].url, `${API_ORIGIN}/api/rooms/${topic}/messages`);
+  const { options } = calls[0];
+  assert.equal(options.method, 'POST');
+  assert.equal(options.body, payload);
+  assert.deepEqual(options.headers, { 'Content-Type': 'text/plain' });
+  assert.equal(options.credentials, 'omit');
+  assert.equal(options.referrerPolicy, 'no-referrer');
+  assert.equal(options.cache, 'no-store');
+  assert.ok(options.signal instanceof AbortSignal);
+  const noFetch = () => assert.fail('Oversized or invalid envelope must not be published');
+  await assert.rejects(publishEnvelope(topic, 'a'.repeat(MAX_ENVELOPE_BYTES + 1), noFetch), /grande/);
+  await assert.rejects(publishEnvelope(topic, {}, noFetch), /grande/);
+});
+
+test('validates publish acknowledgements and normalizes transport and JSON failures', async () => {
+  const retryable = error => error instanceof RelayError && error.name === 'RelayError' && error.retryable === true;
+  for (const invalid of [{ event: 'open' }, { ...event(1), id: 'wrong' }, event(0), { ...event(1), seq: '1' }]) {
+    await assert.rejects(publishEnvelope(topic, 'ciphertext', async () => new Response(JSON.stringify(invalid))), retryable);
+  }
+  await assert.rejects(publishEnvelope(topic, 'ciphertext', async () => { throw new TypeError('network down'); }), retryable);
+  await assert.rejects(publishEnvelope(topic, 'ciphertext', async () => new Response('<html>bad proxy</html>')), retryable);
+  await assert.rejects(publishEnvelope(topic, 'ciphertext', async () => new Response(new ReadableStream({
+    start(controller) { controller.error(new TypeError('stream interrupted')); },
+  }))), retryable);
+  await assert.rejects(publishEnvelope(topic, 'ciphertext', async () => new Response(null)), retryable);
+});
+
+test('exposes useful backend status codes without introducing a daily app quota', async () => {
+  for (const [status, retryable] of [[400, false], [404, false], [413, false], [429, true], [500, true], [503, true]]) {
+    await assert.rejects(publishEnvelope(topic, 'ciphertext', async () => new Response('', { status })), error => {
+      assert.ok(error instanceof RelayError);
+      assert.equal(error.status, status);
+      assert.equal(error.retryable, retryable);
+      if (status === 404) assert.match(error.message, /enlace privado completo/);
+      if (status === 429) assert.ok(!/250|día|diario/.test(error.message));
+      return true;
+    });
+  }
+});
+
+test('loads bounded history pages and preserves both pagination directions', async () => {
+  const calls = [];
+  const fetcher = async (url, options) => {
+    calls.push({ url: new URL(url), options });
+    const after = new URL(url).searchParams.has('after');
+    return new Response(JSON.stringify(after
+      ? page({ messages: [event(3), event(4)], latestSeq: 8, nextAfter: 4, hasMore: true })
+      : page({ nextBefore: 1, hasMore: true })));
+  };
+  assert.deepEqual((await loadHistory(topic, {}, fetcher)).messages.map(value => value.seq), [2, 1]);
+  const older = await loadHistory(topic, { before: 20, limit: 12 }, fetcher);
+  assert.equal(older.nextBefore, 1);
+  const newer = await loadHistory(topic, { after: 2, limit: 50 }, fetcher);
+  assert.deepEqual(newer.messages.map(value => value.seq), [3, 4]);
+  assert.equal(newer.nextAfter, 4);
+  assert.equal(newer.hasMore, true);
+  assert.equal(calls[0].url.origin, new URL(API_ORIGIN).origin);
+  assert.equal(calls[0].url.pathname, `/api/rooms/${topic}/messages`);
+  assert.equal(calls[0].url.searchParams.get('limit'), '30');
+  assert.equal(calls[1].url.searchParams.get('before'), '20');
+  assert.equal(calls[1].url.searchParams.get('limit'), '12');
+  assert.equal(calls[2].url.searchParams.get('after'), '2');
   for (const { options } of calls) {
+    assert.equal(options.method, 'GET');
     assert.equal(options.credentials, 'omit');
     assert.equal(options.referrerPolicy, 'no-referrer');
+    assert.equal(options.cache, 'no-store');
     assert.ok(options.signal instanceof AbortSignal);
   }
-});
-
-test('distinguishes rate limits, temporary failures, rejected content, and invalid acknowledgements', async () => {
-  await assert.rejects(publishEnvelope('topic', 'text', async () => new Response('', { status: 429, headers: { 'Retry-After': '120' } })), error => {
-    assert.ok(error instanceof RelayError);
-    assert.equal(error.retryable, false);
-    assert.equal(error.retryAfter, 120_000);
-    return true;
-  });
-  for (const [status, retryable] of [[400, false], [503, true]]) {
-    await assert.rejects(publishEnvelope('topic', 'text', async () => new Response('', { status })), error => error instanceof RelayError && error.retryable === retryable);
+  const limits = [];
+  for (const limit of [999, -8, 0, 4.9, Number.NaN]) {
+    await loadHistory(topic, { limit }, async url => {
+      limits.push(new URL(url).searchParams.get('limit'));
+      return new Response(JSON.stringify(page()));
+    });
   }
-  await assert.rejects(publishEnvelope('topic', 'text', async () => { throw new Error('network down'); }), error => error instanceof RelayError && error.retryable);
-  await assert.rejects(publishEnvelope('topic', 'text', async () => new Response('{"event":"open"}')), error => error instanceof RelayError && error.retryable);
+  assert.deepEqual(limits, ['50', '1', '30', '4', '30']);
 });
 
-test('normalizes a malformed successful publish acknowledgement as a retryable RelayError', async () => {
-  await assert.rejects(publishEnvelope('topic', 'text', async () => new Response('<html>temporary proxy error</html>', { status: 200 })), error => {
+test('rejects invalid history cursors before fetching and invalid response structures afterwards', async () => {
+  const noFetch = () => assert.fail('Invalid pagination must not initiate a fetch');
+  for (const args of [{ before: 0 }, { before: -1 }, { before: 1.5 }, { before: '3' },
+    { after: -1 }, { after: 2.5 }, { after: '3' }, { after: Infinity }, { before: 3, after: 1 }]) {
+    await assert.rejects(loadHistory(topic, args, noFetch), /Cursor/);
+  }
+  assert.deepEqual((await loadHistory(topic, { after: 0 }, async () => new Response(JSON.stringify(page())))).messages, page().messages);
+  const invalid = [
+    null, {}, page({ messages: {} }), page({ messages: Array.from({ length: 51 }, () => event(1)) }),
+    page({ messages: [event(0)] }), page({ messages: [{ ...event(1), id: 'mismatch' }] }),
+    page({ hasMore: 'yes' }), page({ latestSeq: -1 }), page({ latestSeq: 2.5 }),
+  ];
+  for (const response of invalid) {
+    await assert.rejects(loadHistory(topic, {}, async () => new Response(JSON.stringify(response))), error => error instanceof RelayError && error.retryable);
+  }
+});
+
+test('bounds total streamed history response bytes even when a server reports a small content length', async () => {
+  let cancelled = false;
+  const oversized = new ReadableStream({
+    start(controller) { controller.enqueue(new Uint8Array(4 * 1024 * 1024 + 1).fill(32)); },
+    cancel() { cancelled = true; },
+  });
+  await assert.rejects(loadHistory(topic, {}, async () => new Response(oversized, { headers: { 'Content-Length': '1' } })), error => {
     assert.ok(error instanceof RelayError);
-    assert.equal(error.name, 'RelayError');
     assert.equal(error.retryable, true);
+    assert.match(error.message, /demasiado grande/);
     return true;
   });
+  assert.equal(cancelled, true);
 });
 
-test('reconnects with an overlap cursor and ignores malformed or stale socket events', () => {
-  const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
-  Object.defineProperty(globalThis, 'navigator', { value: { onLine: true }, configurable: true });
+test('uses an owned WebSocket, sync checkpoints, hibernation heartbeat and bounded reconnect lifecycle', () => {
+  const originals = Object.fromEntries(['navigator', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'].map(name => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
+  const timers = new Map();
+  let nextTimer = 1;
+  for (const [name, value] of Object.entries({
+    navigator: { onLine: true },
+    setTimeout: (fn, ms) => { const id = nextTimer++; timers.set(id, { fn, ms, type: 'timeout' }); return id; },
+    clearTimeout: id => timers.delete(id),
+    setInterval: (fn, ms) => { const id = nextTimer++; timers.set(id, { fn, ms, type: 'interval' }); return id; },
+    clearInterval: id => timers.delete(id),
+  })) Object.defineProperty(globalThis, name, { value, configurable: true, writable: true });
   const sockets = [];
   const statuses = [];
   const events = [];
+  const checkpoints = [];
   let connection;
+  const makeSocket = url => {
+    const socket = { url, readyState: 1, sent: [], send(text) { this.sent.push(text); }, close() { this.closed = true; this.readyState = 3; this.onclose?.(); } };
+    sockets.push(socket);
+    return socket;
+  };
   try {
-    connection = subscribe('pasa_test', { onEvent: value => events.push(value), onStatus: value => statuses.push(value) }, url => {
-      const socket = { url, close() { this.closed = true; this.onclose?.(); } };
-      sockets.push(socket);
-      return socket;
-    });
-    assert.match(sockets[0].url, /since=all$/);
-    sockets[0].onmessage({ data: 'bad JSON' });
+    connection = subscribe(topic, { onEvent: value => events.push(value), onStatus: value => statuses.push(value), onSync: value => checkpoints.push(value) }, makeSocket);
+    assert.equal(sockets[0].url, `${API_ORIGIN.replace(/^http/, 'ws')}/api/rooms/${topic}/ws`);
+    assert.deepEqual(statuses, ['connecting']);
+    sockets[0].onopen();
+    const heartbeat = [...timers.values()].find(value => value.type === 'interval');
+    assert.equal(heartbeat.ms, 25000);
+    heartbeat.fn();
+    assert.deepEqual(sockets[0].sent, ['ping']);
+    sockets[0].onmessage({ data: 'pong' });
+    sockets[0].onmessage({ data: 'malformed JSON' });
     sockets[0].onmessage({ data: JSON.stringify({ event: 'open' }) });
-    const current = Math.floor(Date.now() / 1000);
-    sockets[0].onmessage({ data: JSON.stringify({ event: 'message', time: current - 20, id: 'first' }) });
-    sockets[0].onmessage({ data: JSON.stringify({ event: 'message', time: current - 30, id: 'out-of-order' }) });
-    const staleHandler = sockets[0].onmessage;
+    assert.deepEqual(checkpoints, []);
+    sockets[0].onmessage({ data: JSON.stringify({ event: 'open', latestSeq: 80 }) });
+    assert.deepEqual(checkpoints, [80]);
+    assert.equal(statuses.at(-1), 'connected');
+    sockets[0].onmessage({ data: JSON.stringify(event(81)) });
+    sockets[0].onmessage({ data: JSON.stringify({ ...event(82), id: 'invalid' }) });
+    assert.deepEqual(events.map(value => value.seq), [81]);
+    const staleMessage = sockets[0].onmessage;
+    const staleOpen = sockets[0].onopen;
     connection.reconnect();
     assert.equal(sockets[0].closed, true);
-    assert.ok(sockets[1].url.endsWith(`since=${current - 25}`), 'out-of-order event must not move cursor backward');
-    staleHandler({ data: JSON.stringify({ event: 'message', time: current, id: 'stale' }) });
-    assert.equal(events.length, 2);
-    assert.ok(statuses.includes('connected'));
-    sockets[1].onmessage({ data: JSON.stringify({ event: 'message', time: current + 24 * 3600, id: 'future-relay' }) });
-    connection.reconnect();
-    assert.ok(Number(new URL(sockets[2].url).searchParams.get('since')) <= Math.floor(Date.now() / 1000), 'untrusted relay timestamp must not strand the cursor in the future');
+    assert.equal(sockets.length, 2);
+    staleMessage({ data: JSON.stringify(event(83)) });
+    staleOpen();
+    assert.deepEqual(events.map(value => value.seq), [81]);
+    assert.ok(![...timers.values()].some(value => value.type === 'interval'), 'old connection heartbeat must be cleared');
+    sockets[1].onopen();
+    sockets[1].onmessage({ data: JSON.stringify({ event: 'open', latestSeq: 100 }) });
+    assert.deepEqual(checkpoints, [80, 100]);
+    const watchdog = [...timers.entries()].find(([, value]) => value.type === 'timeout' && value.ms === 70000);
+    timers.delete(watchdog[0]); watchdog[1].fn();
+    assert.equal(sockets[1].closed, true);
+    assert.equal(statuses.at(-1), 'reconnecting');
+    const reconnect = [...timers.entries()].find(([, value]) => value.type === 'timeout');
+    assert.ok(reconnect[1].ms >= 2000 && reconnect[1].ms <= 3500);
+    timers.delete(reconnect[0]); reconnect[1].fn();
+    assert.equal(sockets.length, 3);
+    sockets[2].onopen();
     connection.close();
     assert.equal(sockets[2].closed, true);
-    const count = sockets.length;
+    assert.equal(timers.size, 0, 'all timers must be cleaned up');
     connection.reconnect();
-    assert.equal(sockets.length, count);
+    assert.equal(sockets.length, 3, 'closed subscription cannot be reopened');
   } finally {
     connection?.close();
-    if (descriptor) Object.defineProperty(globalThis, 'navigator', descriptor);
-    else delete globalThis.navigator;
+    for (const [name, descriptor] of Object.entries(originals)) {
+      if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+      else delete globalThis[name];
+    }
   }
 });
