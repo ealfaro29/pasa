@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f5f5f0" />
+    <meta name="referrer" content="no-referrer" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' https://ntfy.sh wss://ntfy.sh; img-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'self'" />
+    <meta name="description" content="Pega texto y links en un PC y recíbelos en el otro. Un mismo enlace, sin registro." />
+    <title>pasa — De un PC al otro</title>
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="./styles.css" />
+    <script type="module" src="./app.js"></script>
+  </head>
+  <body>
+    <noscript><p class="noscript-message">Activa JavaScript para conectar tus PCs y compartir texto y links.</p></noscript>
+    <svg class="icon-library" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+      <symbol id="icon-link" viewBox="0 0 24 24"><path d="m10 13 4-4m-6 7-1 1a4.24 4.24 0 0 1-6-6l4-4a4.24 4.24 0 0 1 6 0m2 1 1-1a4.24 4.24 0 0 1 6 6l-4 4a4.24 4.24 0 0 1-6 0" transform="translate(1 0)"/></symbol>
+      <symbol id="icon-arrow" viewBox="0 0 24 24"><path d="M5 12h14m-6-6 6 6-6 6"/></symbol>
+      <symbol id="icon-paste" viewBox="0 0 24 24"><rect x="8" y="4" width="8" height="4" rx="1.4"/><path d="M8 6H6a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-2M8 12h8m-8 4h5"/></symbol>
+      <symbol id="icon-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M15 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h3"/></symbol>
+      <symbol id="icon-close" viewBox="0 0 24 24"><path d="m6 6 12 12M6 18 18 6"/></symbol>
+    </svg>
+
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand" aria-label="pasa">
+          <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true"><rect x="2" y="5" width="20" height="16" rx="4"/><rect x="10" y="12" width="20" height="16" rx="4"/><path d="M13 17h9m-3-3 3 3-3 3"/></svg>
+          <span>pasa<span class="brand-period">.</span></span>
+        </div>
+        <div class="topbar-actions">
+          <span id="connection-status" class="connection-status" role="status" data-state="connecting">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span id="connection-label">Conectando</span>
+          </span>
+          <button id="retry-connection" class="text-button retry-button" type="button" hidden>Reintentar</button>
+          <button id="share-room" class="button button-secondary" type="button">
+            <svg class="icon" aria-hidden="true"><use href="#icon-link"/></svg>
+            <span>Conectar otro PC</span>
+          </button>
+        </div>
+      </header>
+
+      <main>
+        <div class="intro">
+          <div>
+            <p class="eyebrow">TU ATAJO ENTRE PANTALLAS</p>
+            <h1>De un PC al otro<span class="title-period">.</span></h1>
+            <p class="intro-description">Pega texto o un link. Aparece al instante en el otro equipo.</p>
+          </div>
+          <div class="transfer-illustration" aria-hidden="true">
+            <span class="mini-window"><i></i><i></i><i></i><b></b><b></b></span>
+            <svg class="icon"><use href="#icon-arrow"/></svg>
+            <span class="mini-window mini-window-received"><i></i><i></i><i></i><b></b><b></b></span>
+          </div>
+        </div>
+
+        <div class="workspace">
+          <section class="panel input-panel" aria-labelledby="input-title">
+            <div class="panel-header">
+              <div class="panel-title-group"><span class="panel-number">01</span><h2 id="input-title">Input</h2><span class="panel-subtitle">Pega aquí</span></div>
+              <button id="clear-input" class="text-button" type="button" title="Limpiar el texto de este PC">Limpiar</button>
+            </div>
+            <form id="send-form" class="input-form">
+              <label for="message-input" class="sr-only">Texto o links para compartir</label>
+              <textarea id="message-input" name="message" maxlength="100000" spellcheck="false" placeholder="Ese link, esa idea, ese texto…&#10;Pégalo aquí." autocomplete="off" autocapitalize="off" aria-describedby="input-hint"></textarea>
+              <p id="input-hint" class="input-hint" role="status" aria-live="polite"></p>
+              <div class="input-details">
+                <label class="auto-send-toggle"><input id="auto-send" type="checkbox" checked /><span>Enviar al pegar</span></label>
+                <span id="char-count" class="char-count" aria-live="off">0 caracteres</span>
+              </div>
+              <div class="input-toolbar">
+                <button id="paste-button" class="button button-secondary paste-button" type="button"><svg class="icon" aria-hidden="true"><use href="#icon-paste"/></svg><span>Pegar</span></button>
+                <div class="send-actions"><span class="keyboard-hint"><kbd>⌘ / Ctrl</kbd><span>+</span><kbd>↵</kbd></span><button id="send-button" class="button button-primary" type="submit"><span>Enviar</span><svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button></div>
+              </div>
+            </form>
+          </section>
+
+          <div class="workspace-divider" aria-hidden="true"><svg class="icon"><use href="#icon-arrow"/></svg></div>
+
+          <section class="panel output-panel" aria-labelledby="output-title">
+            <div class="panel-header">
+              <div class="panel-title-group"><span class="panel-number">02</span><h2 id="output-title">Output</h2><span id="output-count" class="count-badge">0</span></div>
+              <button id="clear-output" class="text-button" type="button" title="Limpiar el historial solo en este PC">Limpiar</button>
+            </div>
+            <div id="output-list" class="output-list" aria-live="polite" aria-relevant="additions">
+              <div id="empty-state" class="empty-state">
+                <div class="empty-icon" aria-hidden="true"><svg viewBox="0 0 72 66"><rect x="7" y="6" width="43" height="35" rx="7"/><path d="M7 16h43"/><circle cx="14" cy="11" r="1"/><circle cx="19" cy="11" r="1"/><rect x="23" y="25" width="43" height="35" rx="7"/><path d="M23 35h43m-31 11h19m-19 6h12"/><circle cx="30" cy="30" r="1"/><circle cx="35" cy="30" r="1"/></svg></div>
+                <h3>Aquí aparece lo que compartes</h3>
+                <p>Abre este mismo enlace en los dos PCs.<br />Lo que envíes en uno, lo recibes en el otro.</p>
+                <span class="empty-shortcut">Pegar <svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg> Enviar <svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg> Copiar</span>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <footer class="app-footer">
+          <span><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="12" rx="2"/><path d="M8 21h8m-4-4v4"/></svg>Mismo enlace en los dos PCs</span>
+          <div class="footer-security"><span><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3m-4 5v2"/></svg>Cifrado de extremo a extremo</span><details class="service-info"><summary>Cómo funciona</summary><div class="service-info-content">El historial se guarda en este navegador durante 12 horas. El servicio ntfy permite hasta 250 envíos al día; los mensajes normales están disponibles 12 horas y los textos largos, 3 horas. Mantén privado tu enlace.</div></details></div>
+        </footer>
+      </main>
+      <div class="bottom-note">Menos enviártelo por chat. Más seguir con lo tuyo.</div>
+    </div>
+
+    <dialog id="room-dialog" class="room-dialog" aria-labelledby="room-title">
+      <form method="dialog"><button id="room-close" class="dialog-close" type="submit" aria-label="Cerrar"><svg class="icon" aria-hidden="true"><use href="#icon-close"/></svg></button></form>
+      <div class="dialog-link-icon" aria-hidden="true"><svg class="icon"><use href="#icon-link"/></svg></div>
+      <h2 id="room-title">Un enlace. Tus dos PCs.</h2>
+      <p>Abre este enlace en el otro equipo y guárdalo en favoritos. Así vuelves a tu espacio con un clic.</p>
+      <label for="room-link">Tu enlace de conexión</label>
+      <input id="room-link" type="url" readonly spellcheck="false" />
+      <button id="copy-room-link" class="button button-primary dialog-copy" type="button"><svg class="icon" aria-hidden="true"><use href="#icon-copy"/></svg><span>Copiar enlace</span></button>
+      <p class="dialog-privacy">El enlace da acceso a este espacio. Compártelo solo entre tus equipos.</p>
+    </dialog>
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  </body>
+</html>
