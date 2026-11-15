@@ -1,10 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  MAX_TEXT_BYTES, MAX_ENVELOPE_BYTES,
+  MAX_TEXT_BYTES, MAX_ENVELOPE_BYTES, MAX_FILE_BYTES, FILE_CHUNK_BYTES,
   toBase64, fromBase64, newSecret, isRoomSecret, createRoom,
   validateMessage, encryptMessage, decryptMessage, publishEnvelope,
   envelopeFromEvent, RelayError, subscribe, loadHistory,
+  encryptFile, decryptFile, uploadFile, downloadFile, loadFiles, loadArchives, publishArchiveEnvelope,
+  encryptFileChunk, decryptFileChunk, startFileUpload, uploadFilePart, completeFileUpload, downloadFilePart,
 } from '../protocol.js';
 import { API_ORIGIN } from '../config.js';
 
@@ -408,4 +410,289 @@ test('uses an owned WebSocket, sync checkpoints, hibernation heartbeat and bound
       else delete globalThis[name];
     }
   }
+});
+
+
+test('round-trips encrypted file metadata and individual archive operations through the existing envelope', async () => {
+  const { key } = await createRoom(newSecret());
+  const id = crypto.randomUUID();
+  const payloads = [
+    message('', { id, kind: 'file', file: { id, name: 'Diseño final.pdf', type: 'application/pdf', size: 2048 } }),
+    message('', { kind: 'file', id, file: { id, name: 'Vacío.txt', type: '', size: 0 } }),
+    message('', { kind: 'archive', target: { id, seq: 80 }, archived: true }),
+    message('', { kind: 'archive', target: { id, url: 'https://example.com/path?q=1#fragment' }, archived: false }),
+  ];
+  for (const original of payloads) {
+    const envelope = await encryptMessage(key, original);
+    assert.ok(!envelope.includes(original.file?.name || original.target.id));
+    assert.deepEqual(await decryptMessage(key, envelope), original);
+  }
+  const file = payloads[0];
+  const archive = payloads[2];
+  const invalid = [
+    { ...file, text: 'not metadata' }, { ...file, file: { ...file.file, id: crypto.randomUUID() } },
+    ...['', '  ', '..', 'folder/file.pdf', 'folder\\file.pdf', 'bad\nname', 'x'.repeat(256)].map(name => ({ ...file, file: { ...file.file, name } })),
+    ...[-1, 1.5, MAX_FILE_BYTES + 1, '1'].map(size => ({ ...file, file: { ...file.file, size } })),
+    { ...file, file: { ...file.file, type: 'application/pdf\r\n' } },
+    { ...file, file: { ...file.file, type: 'x'.repeat(256) } },
+    { ...archive, archived: 'true' }, { ...archive, target: { id: 'short' } },
+    ...[0, -1, 1.5, '1', Number.MAX_SAFE_INTEGER].map(seq => ({ ...archive, target: { id, seq } })),
+    ...['javascript:alert(1)', 'https://user:password@example.com/', 'example.com', 'https://example.com', 'https://example.com/ '].map(url => ({ ...archive, target: { id, url } })),
+    message('', { kind: 'unknown' }), message('text', { kind: 'unknown' }),
+  ];
+  for (const payload of invalid) {
+    assert.throws(() => validateMessage(payload));
+    await assert.rejects(encryptMessage(key, payload));
+    await assert.rejects(decryptMessage(key, await sealRaw(key, payload)));
+  }
+});
+
+test('encrypts binary files including empty and maximum sizes with fresh IVs and authenticated identity', async () => {
+  const { key } = await createRoom(newSecret());
+  const other = await createRoom(newSecret());
+  const id = crypto.randomUUID();
+  const original = encoder.encode('Archivo privado con ñ y 🙂\u0000\u0001');
+  const first = await encryptFile(key, id, original);
+  const second = await encryptFile(key, id, original.buffer);
+  assert.equal(first.byteLength, original.byteLength + 28);
+  assert.notDeepEqual(first, second);
+  assert.deepEqual(await decryptFile(key, id, first, original.byteLength), original);
+  await assert.rejects(decryptFile(other.key, id, first, original.byteLength));
+  await assert.rejects(decryptFile(key, crypto.randomUUID(), first, original.byteLength));
+  const tampered = first.slice(); tampered[tampered.length - 1] ^= 1;
+  await assert.rejects(decryptFile(key, id, tampered, original.byteLength));
+  await assert.rejects(decryptFile(key, id, first, original.byteLength - 1), /tamaño/);
+  await assert.rejects(decryptFile(key, id, first, undefined), /tamaño/);
+  for (const size of [0, 10 * 1024 * 1024]) {
+    const bytes = new Uint8Array(size).fill(187);
+    const encrypted = await encryptFile(key, id, bytes);
+    assert.deepEqual(await decryptFile(key, id, encrypted, size), bytes);
+  }
+  await assert.rejects(encryptFile(key, id, new Uint8Array(10 * 1024 * 1024 + 1)), /10 MB/);
+  for (const invalidId of ['../private', crypto.randomUUID().toUpperCase(), 'not-an-id', null]) {
+    await assert.rejects(encryptFile(key, invalidId, original), /Identificador/);
+  }
+  await assert.rejects(encryptFile(key, id, 'text'), /Archivo inválido/);
+});
+
+test('uploads only encrypted bytes and envelopes with a multipart request and privacy-preserving options', async () => {
+  const { key } = await createRoom(newSecret());
+  const id = crypto.randomUUID();
+  const bytes = await encryptFile(key, id, encoder.encode('small file'));
+  const envelope = await encryptMessage(key, message('', { id, kind: 'file', file: { id, name: 'private.txt', size: 10, type: 'text/plain' } }));
+  const result = await uploadFile(topic, id, envelope, bytes, async (url, options) => {
+    assert.equal(url, `${API_ORIGIN}/api/rooms/${topic}/files/${id}`);
+    assert.equal(options.method, 'POST');
+    assert.equal(options.credentials, 'omit');
+    assert.equal(options.referrerPolicy, 'no-referrer');
+    assert.equal(options.cache, 'no-store');
+    assert.ok(options.signal instanceof AbortSignal);
+    assert.equal(options.headers, undefined, 'Browser must supply the multipart boundary');
+    assert.ok(options.body instanceof FormData);
+    assert.deepEqual([...options.body.keys()].sort(), ['envelope', 'file']);
+    assert.equal(options.body.get('envelope'), envelope);
+    const file = options.body.get('file');
+    assert.equal(file.name, 'encrypted.bin');
+    assert.equal(file.type, 'application/octet-stream');
+    assert.deepEqual(new Uint8Array(await file.arrayBuffer()), bytes);
+    return ack(9);
+  });
+  assert.deepEqual(result, event(9));
+  const noFetch = () => assert.fail('Invalid upload must not contact backend');
+  await assert.rejects(uploadFile(topic, id, envelope, new Uint8Array(27), noFetch));
+  await assert.rejects(uploadFile(topic, id, envelope, new Uint8Array(10 * 1024 * 1024 + 29), noFetch));
+  await assert.rejects(uploadFile(topic, id, 'x'.repeat(16385), bytes, noFetch));
+  await assert.rejects(uploadFile('bad', id, envelope, bytes, noFetch));
+  await assert.rejects(uploadFile(topic, '../bad', envelope, bytes, noFetch));
+  await assert.rejects(uploadFile(topic, id, envelope, bytes, async () => new Response(JSON.stringify({ event: 'open' }))), error => error instanceof RelayError && error.retryable);
+  for (const [status, expected] of [[404, /no está disponible/], [409, /otro contenido/], [413, /250 MB/], [429, /ocupado/]]) {
+    await assert.rejects(uploadFile(topic, id, envelope, bytes, async () => new Response('', { status })), error => {
+      assert.equal(error.status, status);
+      assert.match(error.message, expected);
+      assert.equal(error.retryable, status === 429);
+      return true;
+    });
+  }
+});
+
+test('downloads bounded encrypted binary data and normalizes interruptions or missing files', async () => {
+  const id = crypto.randomUUID();
+  const bytes = new Uint8Array(100).fill(153);
+  assert.deepEqual(await downloadFile(topic, id, async (url, options) => {
+    assert.equal(url, `${API_ORIGIN}/api/rooms/${topic}/files/${id}`);
+    assert.equal(options.method, 'GET');
+    assert.equal(options.credentials, 'omit');
+    assert.equal(options.referrerPolicy, 'no-referrer');
+    assert.equal(options.cache, 'no-store');
+    assert.ok(options.signal instanceof AbortSignal);
+    return new Response(bytes);
+  }), bytes);
+  await assert.rejects(downloadFile(topic, id, async () => new Response('', { status: 404 })), error => error.status === 404 && !error.retryable);
+  await assert.rejects(downloadFile(topic, id, async () => { throw new TypeError('network down'); }), error => error instanceof RelayError && error.retryable);
+  await assert.rejects(downloadFile(topic, id, async () => new Response(new Uint8Array(27))), /incompleto/);
+  await assert.rejects(downloadFile(topic, id, async () => new Response(null)), /leer/);
+  await assert.rejects(downloadFile(topic, id, async () => new Response(new ReadableStream({ start(controller) { controller.error(new Error('interrupted')); } }))), error => error instanceof RelayError && error.retryable);
+  for (const declared of ['1', String(10 * 1024 * 1024 + 29)]) {
+    let cancelled = false;
+    const response = new Response(new ReadableStream({
+      start(controller) { controller.enqueue(new Uint8Array(10 * 1024 * 1024 + 29)); },
+      cancel() { cancelled = true; },
+    }), { headers: { 'Content-Length': declared } });
+    await assert.rejects(downloadFile(topic, id, async () => response), /demasiado grande/);
+    assert.equal(cancelled, true);
+  }
+  const noFetch = () => assert.fail('Invalid route must not contact backend');
+  await assert.rejects(downloadFile(topic, 'not-a-uuid', noFetch));
+  await assert.rejects(downloadFile('bad', id, noFetch));
+});
+
+test('loads separate file and archive catalogs with pagination and publishes archive mutations to their index', async () => {
+  for (const [loader, suffix] of [[loadFiles, 'files'], [loadArchives, 'archives']]) {
+    const result = await loader(topic, { after: 0, limit: 12 }, async (url, options) => {
+      const parsed = new URL(url);
+      assert.equal(parsed.pathname, `/api/rooms/${topic}/${suffix}`);
+      assert.equal(parsed.searchParams.get('after'), '0');
+      assert.equal(parsed.searchParams.get('limit'), '12');
+      assert.equal(options.method, 'GET');
+      return new Response(JSON.stringify(page({ messages: [event(8)], latestSeq: 8, nextAfter: 8 })));
+    });
+    assert.equal(result.nextAfter, 8);
+    const noFetch = () => assert.fail('Invalid cursor must not contact backend');
+    await assert.rejects(loader(topic, { before: -1 }, noFetch));
+    await assert.rejects(loader(topic, {}, async () => new Response(JSON.stringify(page({ messages: [event(0)] })))));
+  }
+  assert.deepEqual(await publishArchiveEnvelope(topic, 'encrypted archive', async (url, options) => {
+    assert.equal(url, `${API_ORIGIN}/api/rooms/${topic}/archives`);
+    assert.equal(options.body, 'encrypted archive');
+    assert.equal(options.method, 'POST');
+    assert.deepEqual(options.headers, { 'Content-Type': 'text/plain' });
+    return ack(10);
+  }), event(10));
+});
+
+test('validates chunked metadata through 250 MiB without changing legacy encrypted file compatibility', async () => {
+  const { key } = await createRoom(newSecret());
+  const id = crypto.randomUUID();
+  const file = size => ({ id, name: 'Archivo grande.zip', type: 'application/zip', size, format: 'chunks-v1', chunkSize: FILE_CHUNK_BYTES, chunks: Math.max(1, Math.ceil(size / FILE_CHUNK_BYTES)) });
+  for (const size of [0, FILE_CHUNK_BYTES, FILE_CHUNK_BYTES + 1, 50 * 1024 * 1024, MAX_FILE_BYTES]) {
+    const original = message('', { id, kind: 'file', file: file(size) });
+    assert.deepEqual(await decryptMessage(key, await encryptMessage(key, original)), original);
+  }
+  const original = message('', { id, kind: 'file', file: file(MAX_FILE_BYTES) });
+  for (const changes of [{ size: MAX_FILE_BYTES + 1 }, { chunks: 31 }, { chunks: 33 }, { chunks: '32' }, { chunkSize: FILE_CHUNK_BYTES - 1 }, { format: 'chunks-v2' }, { format: undefined }]) {
+    assert.throws(() => validateMessage({ ...original, file: { ...original.file, ...changes } }));
+  }
+  validateMessage(message('', { id, kind: 'file', file: { id, name: 'Anterior.txt', type: '', size: 10 * 1024 * 1024 } }));
+  assert.throws(() => validateMessage(message('', { id, kind: 'file', file: { id, name: 'Anterior.txt', type: '', size: 10 * 1024 * 1024 + 1 } })));
+});
+
+test('authenticates each encrypted file chunk by room, file and part while limiting allocation to 8 MiB', async () => {
+  const { key } = await createRoom(newSecret());
+  const other = await createRoom(newSecret());
+  const id = crypto.randomUUID();
+  for (const size of [0, 71, FILE_CHUNK_BYTES]) {
+    const original = new Uint8Array(size).fill(37);
+    const sealed = await encryptFileChunk(key, id, 2, original);
+    assert.equal(sealed.byteLength, size + 28);
+    assert.deepEqual(await decryptFileChunk(key, id, 2, sealed, size), original);
+  }
+  const original = encoder.encode('Contenido privado');
+  const sealed = await encryptFileChunk(key, id, 0, original);
+  assert.notDeepEqual(sealed, await encryptFileChunk(key, id, 0, original));
+  await assert.rejects(decryptFileChunk(other.key, id, 0, sealed, original.length));
+  await assert.rejects(decryptFileChunk(key, crypto.randomUUID(), 0, sealed, original.length));
+  await assert.rejects(decryptFileChunk(key, id, 1, sealed, original.length));
+  await assert.rejects(decryptFileChunk(key, id, 0, sealed, original.length - 1));
+  await assert.rejects(decryptFileChunk(key, id, 0, sealed, FILE_CHUNK_BYTES + 1));
+  await assert.rejects(decryptFile(key, id, sealed, original.length), 'Chunk and legacy encryption domains must differ');
+  const tampered = sealed.slice(); tampered[tampered.length - 1] ^= 1;
+  await assert.rejects(decryptFileChunk(key, id, 0, tampered, original.length));
+  await assert.rejects(encryptFileChunk(key, id, 0, new Uint8Array(FILE_CHUNK_BYTES + 1)), /8 MB/);
+  for (const index of [-1, 32, 1.5, '0', undefined]) {
+    await assert.rejects(encryptFileChunk(key, id, index, original), /Parte/);
+    await assert.rejects(decryptFileChunk(key, id, index, sealed, original.length), /Parte/);
+  }
+});
+
+test('prepares bounded resumable uploads and validates returned progress before trusting it', async () => {
+  const id = crypto.randomUUID();
+  const bytes = 50 * 1024 * 1024 + 7 * 28;
+  const result = await startFileUpload(topic, id, 'encrypted metadata', 7, bytes, async (url, options) => {
+    assert.equal(url, `${API_ORIGIN}/api/rooms/${topic}/files/${id}/start`);
+    assert.equal(options.method, 'POST');
+    assert.equal(options.credentials, 'omit');
+    assert.equal(options.referrerPolicy, 'no-referrer');
+    assert.equal(options.cache, 'no-store');
+    assert.ok(options.signal instanceof AbortSignal);
+    assert.deepEqual(options.headers, { 'Content-Type': 'application/json' });
+    assert.deepEqual(JSON.parse(options.body), { envelope: 'encrypted metadata', parts: 7, bytes });
+    return new Response(JSON.stringify({ id, uploaded: [0, 2] }));
+  });
+  assert.deepEqual(result.uploaded, [0, 2]);
+  const committed = { id, uploaded: [0], event: event(18) };
+  assert.deepEqual(await startFileUpload(topic, id, 'metadata', 1, 28, async () => new Response(JSON.stringify(committed))), committed);
+  const noFetch = () => assert.fail('Invalid transfer must not reach backend');
+  for (const [parts, size] of [[0, 0], [33, 33 * 28], [2, 56], [1, FILE_CHUNK_BYTES + 29], [32, MAX_FILE_BYTES + 32 * 28 + 1], [1, 27], ['1', 28]]) {
+    await assert.rejects(startFileUpload(topic, id, 'metadata', parts, size, noFetch));
+  }
+  await assert.rejects(startFileUpload(topic, id, 'x'.repeat(16385), 1, 28, noFetch));
+  await assert.rejects(startFileUpload(topic, '../bad', 'metadata', 1, 28, noFetch));
+  for (const reply of [null, { id: 'wrong', uploaded: [] }, { id, uploaded: [7] }, { id, uploaded: [-1] }, { id, uploaded: [0, 0] }, { id, uploaded: ['0'] }, { id, uploaded: [], event: { event: 'open' } }]) {
+    await assert.rejects(startFileUpload(topic, id, 'metadata', 7, bytes, async () => new Response(JSON.stringify(reply))), error => error instanceof RelayError && error.retryable);
+  }
+  assert.equal((await startFileUpload(topic, id, 'metadata', 32, MAX_FILE_BYTES + 32 * 28, async () => new Response(JSON.stringify({ id, uploaded: [] })))).id, id);
+});
+
+test('uploads and completes chunked files through owned bounded endpoints with exact acknowledgements', async () => {
+  const id = crypto.randomUUID();
+  const bytes = new Uint8Array(40).fill(31);
+  assert.deepEqual(await uploadFilePart(topic, id, 4, bytes, async (url, options) => {
+    assert.equal(url, `${API_ORIGIN}/api/rooms/${topic}/files/${id}/parts/4`);
+    assert.equal(options.method, 'POST');
+    assert.equal(options.body, bytes);
+    assert.deepEqual(options.headers, { 'Content-Type': 'application/octet-stream' });
+    assert.equal(options.credentials, 'omit');
+    assert.equal(options.referrerPolicy, 'no-referrer');
+    assert.equal(options.cache, 'no-store');
+    assert.ok(options.signal instanceof AbortSignal);
+    return new Response(JSON.stringify({ id, part: 4 }));
+  }), { id, part: 4 });
+  assert.deepEqual(await completeFileUpload(topic, id, async (url, options) => {
+    assert.equal(url, `${API_ORIGIN}/api/rooms/${topic}/files/${id}/complete`);
+    assert.equal(options.method, 'POST');
+    assert.equal(options.body, undefined);
+    return ack(23);
+  }), event(23));
+  const noFetch = () => assert.fail('Invalid part must not reach backend');
+  for (const length of [27, FILE_CHUNK_BYTES + 29]) await assert.rejects(uploadFilePart(topic, id, 0, new Uint8Array(length), noFetch));
+  for (const index of [-1, 32, 1.5, '0']) await assert.rejects(uploadFilePart(topic, id, index, bytes, noFetch));
+  for (const reply of [{ id, part: 0 }, { id: 'wrong', part: 4 }, { id, part: '4' }]) {
+    await assert.rejects(uploadFilePart(topic, id, 4, bytes, async () => new Response(JSON.stringify(reply))), error => error instanceof RelayError && error.retryable);
+  }
+  await assert.rejects(completeFileUpload(topic, id, async () => new Response(JSON.stringify({ event: 'open' }))), error => error instanceof RelayError && error.retryable);
+  await assert.rejects(uploadFilePart(topic, id, 4, bytes, async () => new Response('', { status: 409 })), error => error.status === 409 && !error.retryable);
+});
+
+test('downloads encrypted parts with an 8 MiB cap even when Content-Length understates the stream', async () => {
+  const id = crypto.randomUUID();
+  const bytes = new Uint8Array(28).fill(72);
+  assert.deepEqual(await downloadFilePart(topic, id, 1, async (url, options) => {
+    assert.equal(url, `${API_ORIGIN}/api/rooms/${topic}/files/${id}/parts/1`);
+    assert.equal(options.method, 'GET');
+    assert.equal(options.credentials, 'omit');
+    assert.equal(options.referrerPolicy, 'no-referrer');
+    assert.equal(options.cache, 'no-store');
+    return new Response(bytes);
+  }), bytes);
+  let cancelled = false;
+  const oversized = new Response(new ReadableStream({
+    start(controller) { controller.enqueue(new Uint8Array(FILE_CHUNK_BYTES + 29)); },
+    cancel() { cancelled = true; },
+  }), { headers: { 'Content-Length': '1' } });
+  await assert.rejects(downloadFilePart(topic, id, 0, async () => oversized), /demasiado grande/);
+  assert.equal(cancelled, true);
+  const noFetch = () => assert.fail('Invalid part must not reach backend');
+  await assert.rejects(downloadFilePart(topic, id, 32, noFetch));
+  await assert.rejects(downloadFilePart(topic, '../private', 0, noFetch));
+  await assert.rejects(downloadFilePart(topic, id, 0, async () => new Response('', { status: 404 })), error => error.status === 404);
 });

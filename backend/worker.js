@@ -11,6 +11,16 @@ const MAX_TEXT_BYTES = 128 * 1024;
 const MAX_JSON_BYTES = MAX_TEXT_BYTES * 6 + 2048;
 export const MAX_ENVELOPE_BYTES = Math.ceil((MAX_JSON_BYTES + 16) * 4 / 3) + 128;
 export const MAX_PAGE_BYTES = 2 * 1024 * 1024;
+export const MAX_FILE_BYTES = 250 * 1024 * 1024;
+export const MAX_LEGACY_FILE_BYTES = 10 * 1024 * 1024;
+export const FILE_PART_BYTES = 8 * 1024 * 1024;
+const MAX_PART_CIPHERTEXT_BYTES = FILE_PART_BYTES + 28;
+const MAX_FILE_PARTS = Math.ceil(MAX_FILE_BYTES / FILE_PART_BYTES);
+const MAX_FILE_ENVELOPE_BYTES = 16 * 1024;
+const MAX_FILE_CIPHERTEXT_BYTES = MAX_LEGACY_FILE_BYTES + 28;
+const MAX_UPLOAD_BYTES = MAX_FILE_CIPHERTEXT_BYTES + MAX_FILE_ENVELOPE_BYTES + 8192;
+const FILE_CHUNK_BYTES = 256 * 1024;
+const UPLOAD_RETENTION_MS = 24 * 60 * 60 * 1000;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8', { fatal: true });
 
@@ -48,9 +58,9 @@ function inspect(request, env) {
   const origin = request.headers.get('Origin');
   if (origin && !ALLOWED_ORIGINS.has(origin)) throw new ApiError(403, 'Origen no permitido');
   const url = new URL(request.url);
-  const match = /^\/api\/rooms\/(pasa_[a-f0-9]{56})\/(messages|ws|preview|image)$/.exec(url.pathname);
-  if (!match || !allowedRooms(env).has(match[1])) throw new ApiError(404, 'Espacio no encontrado');
-  return { url, room: match[1], action: match[2] };
+  const match = /^\/api\/rooms\/(pasa_[a-f0-9]{56})\/(messages|archives|ws|preview|image|files)(?:\/([a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})(?:\/(start|complete|parts\/(0|[1-9]\d?)))?)?$/.exec(url.pathname);
+  if (!match || (match[3] && match[2] !== 'files') || !allowedRooms(env).has(match[1])) throw new ApiError(404, 'Espacio no encontrado');
+  return { url, room: match[1], action: match[2], fileId: match[3], fileAction: match[4]?.split('/')[0], part: match[5] === undefined ? undefined : Number(match[5]) };
 }
 
 function options(request) {
@@ -156,6 +166,77 @@ async function boundedEnvelope(request) {
   return { envelope, bytes };
 }
 
+async function digest(bytes) {
+  const hashed = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+  return [...hashed].map(byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function boundedUpload(request) {
+  const type = request.headers.get('Content-Type');
+  if (!/^multipart\/form-data\s*;/i.test(type || '')) throw new ApiError(415, 'Formato de archivo no permitido');
+  if (Number(request.headers.get('Content-Length')) > MAX_UPLOAD_BYTES) throw new ApiError(413, 'El archivo supera 10 MB');
+  if (!request.body) throw new ApiError(400, 'Falta el archivo cifrado');
+  const reader = request.body.getReader();
+  const parts = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_UPLOAD_BYTES) {
+        await reader.cancel();
+        throw new ApiError(413, 'El archivo supera 10 MB');
+      }
+      parts.push(value);
+    }
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(400, 'No se pudo leer el archivo cifrado');
+  }
+  const body = new Uint8Array(size);
+  let offset = 0;
+  for (const part of parts) { body.set(part, offset); offset += part.byteLength; }
+  let form;
+  try { form = await new Response(body, { headers: { 'Content-Type': type } }).formData(); }
+  catch { throw new ApiError(400, 'Archivo cifrado no válido'); }
+  const envelope = form.get('envelope');
+  const file = form.get('file');
+  if ([...form.keys()].length !== 2 || typeof envelope !== 'string' || !file || typeof file === 'string') {
+    throw new ApiError(400, 'Archivo cifrado no válido');
+  }
+  if (encoder.encode(envelope).byteLength > MAX_FILE_ENVELOPE_BYTES) throw new ApiError(413, 'Los datos del archivo son demasiado grandes');
+  if (file.type !== 'application/octet-stream') throw new ApiError(415, 'Formato de archivo no permitido');
+  if (file.size > MAX_FILE_CIPHERTEXT_BYTES) throw new ApiError(413, 'El archivo supera 10 MB');
+  if (file.size < 28) throw new ApiError(400, 'Archivo cifrado no válido');
+  const metadata = await boundedEnvelope(new Request(request.url, { method: 'POST', body: envelope }));
+  return { envelope: metadata.envelope, metadataDigest: await digest(metadata.bytes), bytes: new Uint8Array(await file.arrayBuffer()) };
+}
+
+async function boundedBytes(request, maxBytes, message) {
+  if (Number(request.headers.get('Content-Length')) > maxBytes) throw new ApiError(413, message);
+  if (!request.body) throw new ApiError(400, 'Faltan los datos del archivo');
+  const reader = request.body.getReader();
+  const chunks = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > maxBytes) { await reader.cancel(); throw new ApiError(413, message); }
+      chunks.push(value);
+    }
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(400, 'No se pudieron leer los datos del archivo');
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  return bytes;
+}
+
 function cursor(value, fallback) {
   if (value === null) return fallback;
   if (!/^(0|[1-9]\d*)$/.test(value)) throw new ApiError(400, 'Cursor no válido');
@@ -179,6 +260,45 @@ export class PasaRoom {
       envelope TEXT NOT NULL,
       created INTEGER NOT NULL
     )`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS archive_messages (
+      seq INTEGER PRIMARY KEY REFERENCES messages(seq)
+    )`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS files (
+      id TEXT PRIMARY KEY,
+      digest TEXT NOT NULL,
+      message_seq INTEGER NOT NULL UNIQUE REFERENCES messages(seq),
+      size INTEGER NOT NULL,
+      created INTEGER NOT NULL
+    )`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS file_chunks (
+      file_id TEXT NOT NULL REFERENCES files(id),
+      part INTEGER NOT NULL,
+      data BLOB NOT NULL,
+      PRIMARY KEY (file_id, part)
+    ) WITHOUT ROWID`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS file_uploads (
+      id TEXT PRIMARY KEY,
+      room TEXT NOT NULL,
+      envelope TEXT NOT NULL,
+      digest TEXT NOT NULL,
+      parts INTEGER NOT NULL,
+      bytes INTEGER NOT NULL,
+      created INTEGER NOT NULL,
+      committed_seq INTEGER UNIQUE REFERENCES messages(seq)
+    )`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS uploaded_parts (
+      file_id TEXT NOT NULL REFERENCES file_uploads(id),
+      part INTEGER NOT NULL,
+      digest TEXT NOT NULL,
+      size INTEGER NOT NULL,
+      object_key TEXT NOT NULL,
+      PRIMARY KEY (file_id, part)
+    ) WITHOUT ROWID`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS upload_cleanup (
+      id TEXT PRIMARY KEY,
+      room TEXT NOT NULL,
+      last_checked INTEGER NOT NULL DEFAULT 0
+    )`);
     if (typeof WebSocketRequestResponsePair !== 'undefined') {
       ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', 'pong'));
     }
@@ -191,19 +311,31 @@ export class PasaRoom {
   async fetch(request) {
     try {
       const route = inspect(request, this.env);
-      if (!['messages', 'ws'].includes(route.action)) throw new ApiError(404, 'Ruta no encontrada');
+      if (!['messages', 'archives', 'files', 'ws'].includes(route.action)) throw new ApiError(404, 'Ruta no encontrada');
       if (request.method === 'OPTIONS') return options(request);
       if (route.action === 'ws') {
         if (request.method !== 'GET') throw new ApiError(405, 'Método no permitido');
         return this.upgrade(request);
       }
-      if (request.method === 'GET') return this.history(request, route.url);
-      if (request.method === 'POST') return await this.publish(request);
+      if (route.action === 'files' && route.fileId) {
+        if (route.fileAction === 'start' && request.method === 'POST') return await this.startUpload(request, route);
+        if (route.fileAction === 'complete' && request.method === 'POST') return await this.completeUpload(request, route);
+        if (route.fileAction === 'parts') {
+          if (request.method === 'POST') return await this.uploadPart(request, route);
+          if (request.method === 'GET') return await this.downloadPart(request, route);
+        }
+        if (route.fileAction) throw new ApiError(405, 'Método no permitido');
+        if (request.method === 'GET') return this.download(request, route.fileId);
+        if (request.method === 'POST') return await this.upload(request, route.fileId);
+        throw new ApiError(405, 'Método no permitido');
+      }
+      if (request.method === 'GET') return this.history(request, route.url, route.action);
+      if (request.method === 'POST' && route.action !== 'files') return await this.publish(request, route.action);
       throw new ApiError(405, 'Método no permitido');
     } catch (error) { return failure(request, error); }
   }
 
-  history(request, url) {
+  history(request, url, category = 'messages') {
     if (url.searchParams.has('before') && url.searchParams.has('after')) throw new ApiError(400, 'Usa un solo cursor');
     const forward = url.searchParams.has('after');
     const position = cursor(url.searchParams.get(forward ? 'after' : 'before'), forward ? 0 : Number.MAX_SAFE_INTEGER);
@@ -211,9 +343,10 @@ export class PasaRoom {
     if (requestedLimit < 1) throw new ApiError(400, 'Tamaño de página no válido');
     const limit = Math.min(50, requestedLimit);
     const latestSeq = this.latestSeq();
+    const source = category === 'files' ? 'messages m JOIN files f ON f.message_seq = m.seq' :
+      category === 'archives' ? 'messages m JOIN archive_messages a ON a.seq = m.seq' : 'messages m';
     const rows = this.sql.exec(
-      forward ? 'SELECT seq, envelope, created FROM messages WHERE seq > ? ORDER BY seq ASC LIMIT ?' :
-        'SELECT seq, envelope, created FROM messages WHERE seq < ? ORDER BY seq DESC LIMIT ?', position, limit);
+      `SELECT m.seq, m.envelope, m.created FROM ${source} WHERE m.seq ${forward ? '>' : '<'} ? ORDER BY m.seq ${forward ? 'ASC' : 'DESC'} LIMIT ?`, position, limit);
     const messages = [];
     let bytes = 200;
     for (const row of rows) {
@@ -225,7 +358,7 @@ export class PasaRoom {
     }
     const lastSeq = messages.length ? messages[messages.length - 1].seq : position;
     const hasMore = messages.length > 0 && this.sql.exec(
-      forward ? 'SELECT seq FROM messages WHERE seq > ? LIMIT 1' : 'SELECT seq FROM messages WHERE seq < ? LIMIT 1', lastSeq).toArray().length > 0;
+      `SELECT m.seq FROM ${source} WHERE m.seq ${forward ? '>' : '<'} ? LIMIT 1`, lastSeq).toArray().length > 0;
     return json(request, {
       messages,
       ...(forward ? { nextAfter: lastSeq } : { nextBefore: hasMore ? lastSeq : null }),
@@ -234,16 +367,25 @@ export class PasaRoom {
     });
   }
 
-  async publish(request) {
+  async publish(request, category = 'messages') {
     const { envelope, bytes } = await boundedEnvelope(request);
-    const digestBytes = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
-    const digest = [...digestBytes].map(byte => byte.toString(16).padStart(2, '0')).join('');
+    const envelopeDigest = await digest(bytes);
     const stored = this.ctx.storage.transactionSync(() => {
-      const existing = this.sql.exec('SELECT seq, envelope, created FROM messages WHERE digest = ?', digest).toArray()[0];
-      if (existing) return { row: existing, inserted: false };
-      const row = this.sql.exec('INSERT INTO messages (digest, envelope, created) VALUES (?, ?, ?) RETURNING seq, envelope, created', digest, envelope, Date.now()).one();
-      return { row, inserted: true };
+      const stored = this.insertMessage(envelope, envelopeDigest);
+      if (category === 'archives') this.sql.exec('INSERT OR IGNORE INTO archive_messages (seq) VALUES (?)', stored.row.seq);
+      return stored;
     });
+    return this.committedEvent(request, stored);
+  }
+
+  insertMessage(envelope, envelopeDigest) {
+    const existing = this.sql.exec('SELECT seq, envelope, created FROM messages WHERE digest = ?', envelopeDigest).toArray()[0];
+    if (existing) return { row: existing, inserted: false };
+    const row = this.sql.exec('INSERT INTO messages (digest, envelope, created) VALUES (?, ?, ?) RETURNING seq, envelope, created', envelopeDigest, envelope, Date.now()).one();
+    return { row, inserted: true };
+  }
+
+  async committedEvent(request, stored) {
     // No client receives a success or live event before the write is durable.
     await this.ctx.storage.sync();
     const event = toEvent(stored.row);
@@ -255,6 +397,232 @@ export class PasaRoom {
       }
     }
     return json(request, event);
+  }
+
+  fileBucket() {
+    if (!this.env.FILES) throw new ApiError(503, 'El almacenamiento de archivos no está disponible. Inténtalo más tarde.');
+    return this.env.FILES;
+  }
+
+  uploadSession(route) {
+    const upload = this.sql.exec('SELECT * FROM file_uploads WHERE id = ? AND room = ? AND id NOT IN (SELECT id FROM upload_cleanup)', route.fileId, route.room).toArray()[0];
+    if (!upload) throw new ApiError(404, 'Subida de archivo no encontrada');
+    return upload;
+  }
+
+  async startUpload(request, route) {
+    this.fileBucket();
+    const type = request.headers.get('Content-Type')?.split(';', 1)[0].trim().toLowerCase();
+    if (type !== 'application/json') throw new ApiError(415, 'Formato de archivo no permitido');
+    const bytes = await boundedBytes(request, MAX_FILE_ENVELOPE_BYTES + 4096, 'Los datos del archivo son demasiado grandes');
+    let body;
+    try { body = JSON.parse(decoder.decode(bytes)); } catch { throw new ApiError(400, 'Datos de archivo no válidos'); }
+    if (!body || Array.isArray(body) || Object.keys(body).some(key => !['envelope', 'parts', 'bytes'].includes(key)) ||
+        typeof body.envelope !== 'string' || !Number.isSafeInteger(body.parts) || body.parts < 1 || body.parts > MAX_FILE_PARTS ||
+        !Number.isSafeInteger(body.bytes) || body.bytes < body.parts * 28 || body.bytes > MAX_FILE_BYTES + body.parts * 28 ||
+        Math.max(1, Math.ceil((body.bytes - body.parts * 28) / FILE_PART_BYTES)) !== body.parts) {
+      throw new ApiError(400, 'Datos de archivo no válidos. El máximo es 250 MB.');
+    }
+    if (encoder.encode(body.envelope).byteLength > MAX_FILE_ENVELOPE_BYTES) throw new ApiError(413, 'Los datos del archivo son demasiado grandes');
+    const metadata = await boundedEnvelope(new Request(request.url, { method: 'POST', body: body.envelope }));
+    const envelopeDigest = await digest(metadata.bytes);
+    const upload = this.ctx.storage.transactionSync(() => {
+      if (this.sql.exec('SELECT id FROM upload_cleanup WHERE id = ?', route.fileId).toArray().length) throw new ApiError(409, 'La subida caducó. Vuelve a seleccionar el archivo.');
+      const existing = this.sql.exec('SELECT * FROM file_uploads WHERE id = ?', route.fileId).toArray()[0];
+      if (existing) {
+        if (existing.room !== route.room || existing.envelope !== body.envelope || existing.parts !== body.parts || existing.bytes !== body.bytes) {
+          throw new ApiError(409, 'Este archivo ya existe con otros datos');
+        }
+        if (existing.committed_seq === null) this.sql.exec('UPDATE file_uploads SET created = ? WHERE id = ?', Date.now(), route.fileId);
+        return existing;
+      }
+      if (this.sql.exec('SELECT id FROM files WHERE id = ?', route.fileId).toArray().length) throw new ApiError(409, 'Este archivo ya existe');
+      this.sql.exec('INSERT INTO file_uploads (id, room, envelope, digest, parts, bytes, created) VALUES (?, ?, ?, ?, ?, ?, ?)', route.fileId, route.room, body.envelope, envelopeDigest, body.parts, body.bytes, Date.now());
+      return { committed_seq: null };
+    });
+    await this.ctx.storage.sync();
+    await this.scheduleCleanup();
+    const uploaded = this.sql.exec('SELECT part FROM uploaded_parts WHERE file_id = ? ORDER BY part ASC', route.fileId).toArray().map(part => part.part);
+    const event = upload.committed_seq === null ? undefined : toEvent(this.sql.exec('SELECT seq, envelope, created FROM messages WHERE seq = ?', upload.committed_seq).one());
+    return json(request, { id: route.fileId, uploaded, ...(event ? { event } : {}) });
+  }
+
+  async uploadPart(request, route) {
+    const bucket = this.fileBucket();
+    const upload = this.uploadSession(route);
+    if (route.part >= upload.parts) throw new ApiError(400, 'Parte de archivo no válida');
+    const type = request.headers.get('Content-Type')?.split(';', 1)[0].trim().toLowerCase();
+    if (type !== 'application/octet-stream') throw new ApiError(415, 'Formato de archivo no permitido');
+    if (upload.committed_seq === null) {
+      this.sql.exec('UPDATE file_uploads SET created = ? WHERE id = ?', Date.now(), route.fileId);
+      await this.ctx.storage.sync();
+      await this.scheduleCleanup();
+    }
+    const expected = route.part < upload.parts - 1 ? MAX_PART_CIPHERTEXT_BYTES : upload.bytes - (upload.parts - 1) * MAX_PART_CIPHERTEXT_BYTES;
+    const bytes = await boundedBytes(request, MAX_PART_CIPHERTEXT_BYTES, 'La parte del archivo es demasiado grande');
+    if (bytes.byteLength !== expected) throw new ApiError(400, 'El tamaño de la parte del archivo no es válido');
+    const partDigest = await digest(bytes);
+    const existing = this.sql.exec('SELECT digest, size FROM uploaded_parts WHERE file_id = ? AND part = ?', route.fileId, route.part).toArray()[0];
+    if (existing) {
+      if (existing.digest !== partDigest || existing.size !== bytes.byteLength) throw new ApiError(409, 'Esta parte ya existe con otro contenido');
+      await this.ctx.storage.sync();
+      return json(request, { id: route.fileId, part: route.part });
+    }
+    if (upload.committed_seq !== null) throw new ApiError(409, 'El archivo ya está completo');
+    // Content-addressed keys keep concurrent conflicting retries from overwriting
+    // the bytes selected by the database transaction.
+    const objectKey = `${route.room}/${route.fileId}/${route.part}/${partDigest}`;
+    await bucket.put(objectKey, bytes, { sha256: partDigest, httpMetadata: { contentType: 'application/octet-stream', cacheControl: 'no-store' } });
+    try {
+      this.ctx.storage.transactionSync(() => {
+        const latest = this.uploadSession(route);
+        const current = this.sql.exec('SELECT digest FROM uploaded_parts WHERE file_id = ? AND part = ?', route.fileId, route.part).toArray()[0];
+        if (current) {
+          if (current.digest !== partDigest) throw new ApiError(409, 'Esta parte ya existe con otro contenido');
+          return;
+        }
+        if (latest.committed_seq !== null) throw new ApiError(409, 'El archivo ya está completo');
+        this.sql.exec('INSERT INTO uploaded_parts (file_id, part, digest, size, object_key) VALUES (?, ?, ?, ?, ?)', route.fileId, route.part, partDigest, bytes.byteLength, objectKey);
+        this.sql.exec('UPDATE file_uploads SET created = ? WHERE id = ?', Date.now(), route.fileId);
+      });
+    } catch (error) {
+      // Only a proven conflicting key is safe to remove: a storage error may
+      // race with another identical retry committing the same object key.
+      if (error instanceof ApiError && [404, 409].includes(error.status)) {
+        const current = this.sql.exec('SELECT object_key FROM uploaded_parts WHERE file_id = ? AND part = ?', route.fileId, route.part).toArray()[0];
+        if (current?.object_key !== objectKey) {
+          try { await bucket.delete(objectKey); } catch { /* Unreferenced ciphertext remains inaccessible. */ }
+        }
+      }
+      throw error;
+    }
+    await this.ctx.storage.sync();
+    return json(request, { id: route.fileId, part: route.part });
+  }
+
+  async scheduleCleanup() {
+    if (typeof this.ctx.storage.setAlarm !== 'function') return;
+    const pending = this.sql.exec('SELECT MIN(created) AS earliest FROM file_uploads WHERE committed_seq IS NULL AND id NOT IN (SELECT id FROM upload_cleanup)').one().earliest;
+    const cleanup = this.sql.exec('SELECT MIN(last_checked) AS earliest FROM upload_cleanup WHERE last_checked >= 0').one().earliest;
+    const earliest = Math.min(pending === null ? Infinity : pending + UPLOAD_RETENTION_MS, cleanup === null ? Infinity : cleanup + UPLOAD_RETENTION_MS);
+    if (!Number.isFinite(earliest)) return;
+    const due = Math.max(Date.now() + 1000, earliest);
+    const current = await this.ctx.storage.getAlarm();
+    if (current === null || due < current) await this.ctx.storage.setAlarm(due);
+  }
+
+  async alarm() {
+    const now = Date.now();
+    // A durable tombstone claims each expired UUID before any asynchronous R2
+    // deletion. Completion and retries can no longer turn it into a shared file.
+    const expired = this.ctx.storage.transactionSync(() => {
+      const uploads = this.sql.exec('SELECT id, room FROM file_uploads WHERE committed_seq IS NULL AND created <= ? AND id NOT IN (SELECT id FROM upload_cleanup)', now - UPLOAD_RETENTION_MS).toArray();
+      for (const upload of uploads) this.sql.exec('INSERT INTO upload_cleanup (id, room) VALUES (?, ?)', upload.id, upload.room);
+      return this.sql.exec('SELECT id, room FROM upload_cleanup WHERE last_checked >= 0 AND last_checked <= ? ORDER BY last_checked ASC LIMIT 20', now - UPLOAD_RETENTION_MS).toArray();
+    });
+    await this.ctx.storage.sync();
+    for (const upload of expired) {
+      try {
+        const bucket = this.fileBucket();
+        let cursor;
+        do {
+          const page = await bucket.list({ prefix: `${upload.room}/${upload.id}/`, limit: 1000, ...(cursor ? { cursor } : {}) });
+          if (page.objects.length) await bucket.delete(page.objects.map(object => object.key));
+          cursor = page.truncated ? page.cursor : undefined;
+        } while (cursor);
+        this.ctx.storage.transactionSync(() => {
+          const firstPass = this.sql.exec('SELECT id FROM file_uploads WHERE id = ?', upload.id).toArray().length > 0;
+          this.sql.exec('DELETE FROM uploaded_parts WHERE file_id = ?', upload.id);
+          this.sql.exec('DELETE FROM file_uploads WHERE id = ? AND committed_seq IS NULL', upload.id);
+          // Recheck once after another day to catch late in-flight writes, then
+          // retain only the UUID tombstone without recurring object-list costs.
+          this.sql.exec('UPDATE upload_cleanup SET last_checked = ? WHERE id = ?', firstPass ? Date.now() : -1, upload.id);
+        });
+      } catch {
+        this.sql.exec('UPDATE upload_cleanup SET last_checked = ? WHERE id = ?', Date.now() - UPLOAD_RETENTION_MS + 60000, upload.id);
+      }
+    }
+    await this.ctx.storage.sync();
+    await this.scheduleCleanup();
+  }
+
+  async completeUpload(request, route) {
+    this.fileBucket();
+    if (request.body) {
+      const bytes = await boundedBytes(request, 1, 'La finalización no admite contenido');
+      if (bytes.byteLength) throw new ApiError(400, 'La finalización no admite contenido');
+    }
+    const stored = this.ctx.storage.transactionSync(() => {
+      const upload = this.uploadSession(route);
+      if (upload.committed_seq !== null) return { inserted: false, row: this.sql.exec('SELECT seq, envelope, created FROM messages WHERE seq = ?', upload.committed_seq).one() };
+      const parts = this.sql.exec('SELECT part, size FROM uploaded_parts WHERE file_id = ? ORDER BY part ASC', route.fileId).toArray();
+      if (parts.length !== upload.parts || parts.some((part, index) => part.part !== index || part.size !== (index < upload.parts - 1 ? MAX_PART_CIPHERTEXT_BYTES : upload.bytes - index * MAX_PART_CIPHERTEXT_BYTES)) ||
+          parts.reduce((sum, part) => sum + part.size, 0) !== upload.bytes) {
+        throw new ApiError(409, 'Faltan partes del archivo. Reintenta la subida.');
+      }
+      const message = this.insertMessage(upload.envelope, upload.digest);
+      if (this.sql.exec('SELECT id FROM files WHERE id = ? OR message_seq = ?', route.fileId, message.row.seq).toArray().length) throw new ApiError(409, 'Los datos de este archivo ya están en uso');
+      this.sql.exec('INSERT INTO files (id, digest, message_seq, size, created) VALUES (?, ?, ?, ?, ?)', route.fileId, upload.digest, message.row.seq, upload.bytes, Date.now());
+      this.sql.exec('UPDATE file_uploads SET committed_seq = ? WHERE id = ?', message.row.seq, route.fileId);
+      return message;
+    });
+    return this.committedEvent(request, stored);
+  }
+
+  async downloadPart(request, route) {
+    const bucket = this.fileBucket();
+    const part = this.sql.exec('SELECT p.object_key, p.size FROM uploaded_parts p JOIN file_uploads u ON u.id = p.file_id WHERE p.file_id = ? AND p.part = ? AND u.room = ? AND u.committed_seq IS NOT NULL', route.fileId, route.part, route.room).toArray()[0];
+    if (!part) throw new ApiError(404, 'Archivo no encontrado');
+    const object = await bucket.get(part.object_key);
+    if (!object || object.size !== part.size) throw new ApiError(503, 'No se pudo recuperar el archivo. Inténtalo de nuevo.');
+    const headers = headersFor(request);
+    headers.set('Content-Type', 'application/octet-stream');
+    headers.set('Content-Length', String(part.size));
+    headers.set('Content-Disposition', 'attachment; filename="encrypted.bin"');
+    headers.set('Content-Security-Policy', "default-src 'none'; sandbox");
+    return new Response(object.body, { headers });
+  }
+
+  async upload(request, fileId) {
+    const { envelope, metadataDigest, bytes } = await boundedUpload(request);
+    const fileDigest = await digest(bytes);
+    const stored = this.ctx.storage.transactionSync(() => {
+      if (this.sql.exec('SELECT id FROM file_uploads WHERE id = ?', fileId).toArray().length) throw new ApiError(409, 'Este archivo ya existe');
+      const existing = this.sql.exec('SELECT f.digest, m.seq, m.envelope, m.created FROM files f JOIN messages m ON m.seq = f.message_seq WHERE f.id = ?', fileId).toArray()[0];
+      if (existing) {
+        if (existing.digest !== fileDigest || existing.envelope !== envelope) throw new ApiError(409, 'Este archivo ya existe con otro contenido');
+        return { row: existing, inserted: false };
+      }
+      const message = this.insertMessage(envelope, metadataDigest);
+      if (this.sql.exec('SELECT id FROM files WHERE message_seq = ?', message.row.seq).toArray().length) throw new ApiError(409, 'Los datos de este archivo ya están en uso');
+      this.sql.exec('INSERT INTO files (id, digest, message_seq, size, created) VALUES (?, ?, ?, ?, ?)', fileId, fileDigest, message.row.seq, bytes.byteLength, Date.now());
+      for (let offset = 0, part = 0; offset < bytes.byteLength; offset += FILE_CHUNK_BYTES, part++) {
+        this.sql.exec('INSERT INTO file_chunks (file_id, part, data) VALUES (?, ?, ?)', fileId, part, bytes.subarray(offset, offset + FILE_CHUNK_BYTES));
+      }
+      return message;
+    });
+    return this.committedEvent(request, stored);
+  }
+
+  download(request, fileId) {
+    const file = this.sql.exec('SELECT size FROM files WHERE id = ?', fileId).toArray()[0];
+    if (!file) throw new ApiError(404, 'Archivo no encontrado');
+    if (this.sql.exec('SELECT id FROM file_uploads WHERE id = ? AND committed_seq IS NOT NULL', fileId).toArray().length) throw new ApiError(409, 'Actualiza Pasa para descargar este archivo');
+    if (file.size < 28 || file.size > MAX_FILE_CIPHERTEXT_BYTES) throw new Error('Invalid stored file size');
+    const bytes = new Uint8Array(file.size);
+    let offset = 0;
+    for (const chunk of this.sql.exec('SELECT data FROM file_chunks WHERE file_id = ? ORDER BY part ASC', fileId)) {
+      const part = new Uint8Array(chunk.data);
+      bytes.set(part, offset);
+      offset += part.byteLength;
+    }
+    if (offset !== file.size) throw new Error('Incomplete stored file');
+    const headers = headersFor(request);
+    headers.set('Content-Type', 'application/octet-stream');
+    headers.set('Content-Length', String(bytes.byteLength));
+    headers.set('Content-Disposition', 'attachment; filename="encrypted.bin"');
+    headers.set('Content-Security-Policy', "default-src 'none'; sandbox");
+    return new Response(bytes, { headers });
   }
 
   upgrade(request) {
@@ -288,7 +656,7 @@ export default {
       if (origin && !ALLOWED_ORIGINS.has(origin)) throw new ApiError(403, 'Origen no permitido');
       if (new URL(request.url).pathname === '/health') {
         if (request.method !== 'GET') throw new ApiError(405, 'Método no permitido');
-        return json(request, { status: 'ok', version: 'pasa-own-v2' });
+        return json(request, { status: 'ok', version: 'pasa-own-v3.1' });
       }
       const route = inspect(request, env);
       if (request.method === 'OPTIONS') return options(request);

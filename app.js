@@ -1,6 +1,8 @@
-import { createRoom, decryptMessage, encryptMessage, isRoomSecret, loadHistory, MAX_TEXT_BYTES, publishEnvelope, subscribe } from './protocol.js?v=3.0.0';
-import { extractLinks } from './links.js?v=3.0.0';
-import { createLinkCard, setPreviewContext } from './preview-cards.js?v=3.0.0';
+import { createRoom, decryptMessage, encryptMessage, isRoomSecret, loadHistory, loadArchives, MAX_TEXT_BYTES, publishEnvelope, publishArchiveEnvelope, subscribe } from './protocol.js?v=3.1.0';
+import { createLinkCard, setPreviewContext } from './preview-cards.js?v=3.1.0';
+import { ArchiveState, archiveKey } from './archive-state.js?v=3.1.0';
+import { FileShelf } from './shared-files.js?v=3.1.0';
+import { messageView } from './message-view.js?v=3.1.0';
 
 const $ = id => document.getElementById(id);
 const input = $('message-input');
@@ -10,6 +12,12 @@ const encoder = new TextEncoder();
 const records = new Map();
 const seenEvents = new Set();
 const inFlightEvents = new Set();
+const archives = new ArchiveState();
+const archiveBusy = new Set();
+let archiveReady = false;
+let archiveSyncing = false;
+let archiveCursor = 0;
+let archivedView = false;
 let room;
 let storageKey;
 let transport;
@@ -43,6 +51,7 @@ if (!/^[a-zA-Z0-9-]{16,64}$/.test(device || '')) {
   device = crypto.randomUUID();
   storage.set('pasa.device.v1', device);
 }
+const fileShelf = new FileShelf({ device, icon, toast, onEvent: event => receive(event, { announce: false }) });
 
 function toast(message, duration = 4000) {
   clearTimeout(toastTimer);
@@ -71,7 +80,14 @@ function persist() {
     size += record.envelope.length;
     items.push({ envelope: record.envelope, state: record.state, seq: record.seq || 0, retryable: record.retryable, retryAt: record.retryAt, attempts: record.attempts || 0 });
   }
-  const saved = storage.set(storageKey, JSON.stringify({ v: 1, items, hiddenBefore, draft: draftEnvelope, migratedOwn }));
+  const archiveItems = [];
+  let archiveBytes = 0;
+  for (const { seq, envelope } of archives.entries().reverse()) {
+    if (archiveBytes + envelope.length > 512000) continue;
+    archiveBytes += envelope.length;
+    archiveItems.push({ seq, envelope });
+  }
+  const saved = storage.set(storageKey, JSON.stringify({ v: 1, items, archives: archiveItems, hiddenBefore, draft: draftEnvelope, migratedOwn }));
   if (!saved && !retentionWarning) {
     retentionWarning = true;
     toast('El navegador no pudo guardar el historial local. La sincronización sigue disponible.', 6000);
@@ -93,8 +109,46 @@ function linkCard(url) {
   return createLinkCard(url);
 }
 
+function displayRecord(record) {
+  const { message, state } = record;
+  if (!archivedView && message.created <= hiddenBefore && !['pending', 'failed'].includes(state)) {
+    const restored = archives.entries().some(({ message: action }) => action.target.id === message.id && !action.archived && action.created > hiddenBefore);
+    if (!restored) return null;
+  }
+  return messageView(message, archives, archivedView);
+}
+
+function archiveButton(record, url) {
+  const target = { id: record.message.id, seq: record.seq, ...(url ? { url: new URL(url).href } : {}) };
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'copy-message archive-message';
+  button.disabled = !archiveReady || !record.seq || archiveBusy.has(archiveKey(target));
+  button.append(icon(archivedView ? 'restore' : 'archive'), document.createTextNode(archivedView ? 'Restaurar' : 'Archivar'));
+  button.setAttribute('aria-label', `${archivedView ? 'Restaurar' : 'Archivar'} ${url ? `link ${url}` : 'mensaje'}`);
+  button.title = 'El cambio se sincroniza con el otro equipo';
+  button.addEventListener('click', () => setArchived(record, { ...target, seq: record.seq }, !archivedView));
+  return button;
+}
+
+async function setArchived(record, target, archived) {
+  const key = archiveKey(target);
+  if (!archiveReady || archiveBusy.has(key)) return;
+  archiveBusy.add(key);
+  record.node = null;
+  render();
+  try {
+    const message = { v: 1, kind: 'archive', id: crypto.randomUUID(), device, created: Date.now(), text: '', target, archived };
+    const envelope = await encryptMessage(room.key, message);
+    await receive(await publishArchiveEnvelope(room.topic, envelope), { announce: false });
+    toast(archived ? 'Archivado. Puedes recuperarlo en Archivados.' : 'Restaurado en ambos equipos.');
+  } catch (error) { toast(error.message || 'No se pudo guardar el cambio.', 6000); }
+  finally { archiveBusy.delete(key); record.node = null; render(); }
+}
+
 function renderRecord(record, fresh) {
   const { message, state } = record;
+  const display = displayRecord(record);
   const own = message.device === device;
   const card = document.createElement('article');
   card.className = 'message-card' + (fresh ? ' message-new' : '') + (state === 'pending' ? ' message-pending' : '') + (state === 'failed' ? ' message-failed' : '');
@@ -115,18 +169,21 @@ function renderRecord(record, fresh) {
   meta.append(origin, time);
   const body = document.createElement('div');
   body.className = 'message-body';
-  const links = extractLinks(message.text);
-  const onlyLink = links.length === 1 && [links[0], links[0].replace(/^https:\/\//, '')].includes(message.text.trim());
-  if (!onlyLink) {
+  if (display.text) {
     const text = document.createElement('div');
     text.className = 'message-text';
-    text.textContent = message.text;
+    text.textContent = display.text;
     body.append(text);
   }
-  if (links.length) {
+  if (display.visibleLinks.length) {
     const cards = document.createElement('div');
     cards.className = 'link-cards';
-    links.forEach(url => cards.append(linkCard(url)));
+    display.visibleLinks.forEach(url => {
+      const item = document.createElement('div');
+      item.className = 'link-item';
+      item.append(linkCard(url), archiveButton(record, url));
+      cards.append(item);
+    });
     body.append(cards);
   }
   const actions = document.createElement('div');
@@ -161,8 +218,9 @@ function renderRecord(record, fresh) {
   copy.className = 'copy-message';
   copy.append(icon('copy'), document.createTextNode('Copiar'));
   copy.setAttribute('aria-label', 'Copiar el texto completo');
-  copy.addEventListener('click', () => copyText(message.text, 'Texto copiado'));
+  copy.addEventListener('click', () => copyText(display.copy, 'Texto copiado'));
   buttons.append(copy);
+  if (!display.links.length) buttons.append(archiveButton(record));
   actions.append(buttons);
   card.append(meta, body, actions);
   const error = document.createElement('p');
@@ -181,6 +239,7 @@ function updateRecordNode(record, freshId) {
   const own = record.message.device === device;
   card.querySelector('.message-status').textContent = record.state === 'pending' ? 'Pendiente de envío' : record.state === 'failed' ? 'No enviado' : own ? 'Enviado' : 'Recibido';
   card.querySelector('.retry-message').hidden = record.state !== 'failed';
+  card.querySelectorAll('.archive-message').forEach(button => { button.disabled = !archiveReady || !record.seq || archiveBusy.size > 0; });
   const error = card.querySelector('.message-error');
   error.textContent = record.error || '';
   error.hidden = record.state !== 'failed' || !record.error;
@@ -188,7 +247,7 @@ function updateRecordNode(record, freshId) {
 }
 
 function render(freshId) {
-  const visible = [...records.values()].filter(record => record.message.created > hiddenBefore || ['pending', 'failed'].includes(record.state)).sort((a, b) => b.message.created - a.message.created);
+  const visible = [...records.values()].filter(record => displayRecord(record)).sort((a, b) => b.message.created - a.message.created);
   const atTop = output.scrollTop < 30;
   const oldHeight = output.scrollHeight;
   const oldScroll = output.scrollTop;
@@ -200,7 +259,10 @@ function render(freshId) {
     if (output.children[index] !== node) output.insertBefore(node, output.children[index] || null);
   });
   $('output-count').textContent = visible.length;
-  $('clear-output').disabled = !visible.length;
+  $('clear-output').disabled = !visible.length || archivedView;
+  empty.querySelector('h3').textContent = archivedView ? 'Tus links archivados, a mano' : 'Aquí aparece lo que compartes';
+  empty.querySelector('p').textContent = archivedView ? 'Lo que archives aparece aquí. Pulsa Restaurar para devolverlo a tus links activos.' : 'Abre este mismo enlace en los dos PCs. Lo que envíes en uno, lo recibes en el otro.';
+  empty.querySelector('.empty-shortcut').hidden = archivedView;
   refreshHistoryButton();
   if (atTop || !freshId) output.scrollTop = freshId ? 0 : oldScroll;
   else output.scrollTop = oldScroll + output.scrollHeight - oldHeight;
@@ -320,6 +382,21 @@ async function receive(event, { announce = true } = {}) {
     const message = await decryptMessage(room.key, envelope);
     seenEvents.add(event.id);
     if (seenEvents.size > 500) seenEvents.delete(seenEvents.values().next().value);
+    if (message.kind === 'archive') {
+      if (archives.apply(message, event.seq, envelope)) {
+        const target = records.get(message.target.id);
+        if (target) target.node = null;
+        persist();
+        render();
+        if (archivedView && message.archived && !target && message.target.seq) {
+          loadHistory(room.topic, { before: message.target.seq + 1, limit: 1 })
+            .then(async page => { for (const item of page.messages) await receive(item, { announce: false }); })
+            .catch(() => { $('archive-status').textContent = 'No se pudo cargar un link archivado.'; $('retry-archives').hidden = false; });
+        }
+      }
+      return;
+    }
+    if (message.kind === 'file') fileShelf.accept(message);
     const existing = records.get(message.id);
     if (existing) {
       existing.seq = event.seq;
@@ -339,6 +416,33 @@ async function receive(event, { announce = true } = {}) {
   } catch {
     // The server cannot authenticate ciphertext. Only this browser has the key.
   } finally { inFlightEvents.delete(event.id); }
+}
+
+async function syncArchives() {
+  if (archiveSyncing) return;
+  archiveSyncing = true;
+  $('archive-status').textContent = 'Sincronizando archivados…';
+  $('retry-archives').hidden = true;
+  try {
+    while (true) {
+      const page = await loadArchives(room.topic, { after: archiveCursor, limit: 50 });
+      for (const event of page.messages) await receive(event, { announce: false });
+      if (page.nextAfter > archiveCursor) archiveCursor = page.nextAfter;
+      else if (page.hasMore) throw new Error('No se pudo recuperar el archivo. Reintenta.');
+      if (!page.hasMore) break;
+    }
+    // An archive may refer to an original beyond the latest history page.
+    for (const { message } of archives.entries()) {
+      if (!message.archived || !message.target.seq || records.has(message.target.id)) continue;
+      const page = await loadHistory(room.topic, { before: message.target.seq + 1, limit: 1 });
+      for (const event of page.messages) await receive(event, { announce: false });
+    }
+    archiveReady = true;
+    $('archive-status').textContent = '';
+  } catch (error) {
+    $('archive-status').textContent = error.message || 'No se pudieron sincronizar los archivados.';
+    $('retry-archives').hidden = false;
+  } finally { archiveSyncing = false; render(); }
 }
 
 function refreshHistoryButton() {
@@ -388,7 +492,7 @@ async function catchUp(latestSeq) {
 }
 
 function connect() {
-  transport = subscribe(room.topic, { onEvent: receive, onStatus: setConnection, onSync: catchUp });
+  transport = subscribe(room.topic, { onEvent: receive, onStatus: setConnection, onSync: latest => { catchUp(latest); syncArchives(); } });
 }
 
 async function migrateCachedHistory() {
@@ -480,12 +584,25 @@ $('clear-output').addEventListener('click', () => {
   hiddenBefore = Date.now();
   // Pending sends stay visible and are never cancelled by clearing local history.
   for (const [id, record] of records) {
-    if (!['pending', 'failed'].includes(record.state)) records.delete(id);
+    if (!['pending', 'failed'].includes(record.state) && record.message.kind !== 'file') records.delete(id);
   }
+  seenEvents.clear();
   persist();
   render();
   toast('Historial limpiado en este PC');
 });
+$('retry-archives').addEventListener('click', syncArchives);
+for (const [id, isArchive] of [['show-active', false], ['show-archived', true]]) {
+  $(id).addEventListener('click', () => {
+    archivedView = isArchive;
+    $('show-active').setAttribute('aria-pressed', String(!isArchive));
+    $('show-archived').setAttribute('aria-pressed', String(isArchive));
+    for (const record of records.values()) record.node = null;
+    output.scrollTop = 0;
+    render();
+    if (isArchive) syncArchives();
+  });
+}
 $('load-older').addEventListener('click', async () => {
   if (!ready || loadingOlder) return;
   const previousHiddenBefore = hiddenBefore;
@@ -590,6 +707,14 @@ async function init() {
   if (saved?.v === 1) {
     hiddenBefore = Number.isFinite(saved.hiddenBefore) ? saved.hiddenBefore : 0;
     migratedOwn = saved.migratedOwn === true;
+    if (Array.isArray(saved.archives)) {
+      for (const item of saved.archives) {
+        try {
+          const message = await decryptMessage(room.key, item.envelope);
+          if (message.kind === 'archive') archives.apply(message, item.seq, item.envelope);
+        } catch { /* Authenticate cached archive states before applying. */ }
+      }
+    }
     const items = Array.isArray(saved.items) ? saved.items.slice(0, 100) : [];
     await Promise.all(items.map(async item => {
       try {
@@ -598,6 +723,7 @@ async function init() {
         const state = allowedStates.includes(item.state) ? item.state : 'received';
         const seq = Number.isSafeInteger(item.seq) && item.seq > 0 ? item.seq : 0;
         records.set(message.id, { message, envelope: item.envelope, state, seq, attempts: item.attempts || 0, retryable: Boolean(item.retryable), retryAt: Number(item.retryAt) || 0 });
+        if (message.kind === 'file') fileShelf.accept(message);
       } catch { /* Skip entries that fail authentication. */ }
     }));
     if (typeof saved.draft === 'string') {
@@ -623,6 +749,8 @@ async function init() {
   ready = true;
   render();
   refreshInput();
+  await syncArchives();
+  fileShelf.connect(room);
   if (input.value.trim()) saveDraft().catch(() => {});
   connect();
   migrateCachedHistory();
