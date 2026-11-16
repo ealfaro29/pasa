@@ -1,4 +1,4 @@
-import { extractLinks } from './links.js?v=3.2.0';
+import { extractLinks } from './links.js?v=3.3.0';
 
 // Remove every spelling of a hidden URL, including canonical duplicates, while
 // preserving prose and the punctuation surrounding a pasted link.
@@ -12,7 +12,7 @@ function withoutLinks(text, hidden) {
 }
 
 export function messageView(message, archives, archivedView) {
-  if (message.kind === 'file' || message.kind === 'archive') return null;
+  if (message.kind === 'file' || message.kind === 'file-delete' || message.kind === 'archive') return null;
   const links = extractLinks(message.text);
   const wholeArchived = archives.isMessageArchived(message.id);
   if (wholeArchived !== archivedView && (wholeArchived || !links.length)) return null;

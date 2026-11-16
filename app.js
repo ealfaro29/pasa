@@ -1,8 +1,8 @@
-import { createRoom, decryptMessage, encryptMessage, isRoomSecret, loadHistory, loadArchives, MAX_TEXT_BYTES, publishEnvelope, publishArchiveEnvelope, subscribe } from './protocol.js?v=3.2.0';
-import { createLinkCard, setPreviewContext } from './preview-cards.js?v=3.2.0';
-import { ArchiveState, archiveKey } from './archive-state.js?v=3.2.0';
-import { FileShelf } from './shared-files.js?v=3.2.0';
-import { messageView } from './message-view.js?v=3.2.0';
+import { createRoom, decryptMessage, encryptMessage, isRoomSecret, loadHistory, loadArchives, MAX_TEXT_BYTES, publishEnvelope, publishArchiveEnvelope, subscribe } from './protocol.js?v=3.3.0';
+import { createLinkCard, setPreviewContext } from './preview-cards.js?v=3.3.0';
+import { ArchiveState, archiveKey } from './archive-state.js?v=3.3.0';
+import { FileShelf } from './shared-files.js?v=3.3.0';
+import { messageView } from './message-view.js?v=3.3.0';
 
 const $ = id => document.getElementById(id);
 const input = $('message-input');
@@ -11,7 +11,7 @@ const empty = $('empty-state');
 const encoder = new TextEncoder();
 const records = new Map();
 const seenEvents = new Set();
-const inFlightEvents = new Set();
+const inFlightEvents = new Map();
 const archives = new ArchiveState();
 const archiveBusy = new Set();
 let archiveReady = false;
@@ -373,9 +373,15 @@ function scheduleRetries() {
   }, Math.max(1000, next - Date.now()));
 }
 
-async function receive(event, { announce = true } = {}) {
-  if (seenEvents.has(event.id) || inFlightEvents.has(event.id)) return;
-  inFlightEvents.add(event.id);
+function receive(event, options = {}) {
+  if (seenEvents.has(event.id)) return Promise.resolve();
+  if (inFlightEvents.has(event.id)) return inFlightEvents.get(event.id);
+  const pending = processEvent(event, options).finally(() => inFlightEvents.delete(event.id));
+  inFlightEvents.set(event.id, pending);
+  return pending;
+}
+
+async function processEvent(event, { announce = true } = {}) {
   try {
     const envelope = event.message;
     if (typeof envelope !== 'string') return;
@@ -396,7 +402,14 @@ async function receive(event, { announce = true } = {}) {
       }
       return;
     }
-    if (message.kind === 'file') fileShelf.accept(message);
+    if (message.kind === 'file-delete') {
+      fileShelf.remove(message.target.id);
+      records.delete(message.target.id);
+      persist();
+      render();
+      return;
+    }
+    if (message.kind === 'file' && !fileShelf.accept(message)) return;
     const existing = records.get(message.id);
     if (existing) {
       existing.seq = event.seq;
@@ -415,7 +428,7 @@ async function receive(event, { announce = true } = {}) {
     if (announce && document.hidden && message.device !== device) document.title = '• Nuevo texto | pasa';
   } catch {
     // The server cannot authenticate ciphertext. Only this browser has the key.
-  } finally { inFlightEvents.delete(event.id); }
+  }
 }
 
 async function syncArchives() {
@@ -492,7 +505,7 @@ async function catchUp(latestSeq) {
 }
 
 function connect() {
-  transport = subscribe(room.topic, { onEvent: receive, onStatus: setConnection, onSync: latest => { catchUp(latest); syncArchives(); } });
+  transport = subscribe(room.topic, { onEvent: receive, onStatus: setConnection, onSync: latest => { catchUp(latest); syncArchives(); fileShelf.refreshDeletions(); } });
 }
 
 async function migrateCachedHistory() {
@@ -719,11 +732,12 @@ async function init() {
     await Promise.all(items.map(async item => {
       try {
         const message = await decryptMessage(room.key, item.envelope);
+        if (message.kind === 'file-delete') { fileShelf.remove(message.target.id); return; }
+        if (message.kind === 'file' && !fileShelf.accept(message)) return;
         const allowedStates = ['sent', 'received', 'pending', 'failed'];
         const state = allowedStates.includes(item.state) ? item.state : 'received';
         const seq = Number.isSafeInteger(item.seq) && item.seq > 0 ? item.seq : 0;
         records.set(message.id, { message, envelope: item.envelope, state, seq, attempts: item.attempts || 0, retryable: Boolean(item.retryable), retryAt: Number(item.retryAt) || 0 });
-        if (message.kind === 'file') fileShelf.accept(message);
       } catch { /* Skip entries that fail authentication. */ }
     }));
     if (typeof saved.draft === 'string') {

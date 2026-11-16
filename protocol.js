@@ -1,5 +1,5 @@
 // Message transport sends ciphertext. The key stays in the URL fragment.
-import { API_ORIGIN } from './config.js?v=3.2.0';
+import { API_ORIGIN } from './config.js?v=3.3.0';
 export const MAX_TEXT_BYTES = 128 * 1024;
 export const MAX_FILE_BYTES = 250 * 1024 * 1024;
 export const FILE_CHUNK_BYTES = 8 * 1024 * 1024;
@@ -97,6 +97,11 @@ export function validateMessage(message) {
           file.chunks > MAX_FILE_PARTS) throw new Error('Formato de archivo inválido');
     } else if (file.format !== undefined || file.size > LEGACY_MAX_FILE_BYTES) {
       throw new Error('Formato de archivo inválido');
+    }
+  } else if (message.kind === 'file-delete') {
+    const target = message.target;
+    if (message.text !== '' || !target || typeof target.id !== 'string' || !FILE_ID_PATTERN.test(target.id)) {
+      throw new Error('Eliminación de archivo inválida');
     }
   } else if (message.kind === 'archive') {
     const target = message.target;
@@ -248,6 +253,7 @@ function responseError(status, file = false) {
   const messages = {
     404: file ? 'El archivo o el espacio no está disponible. Revisa el enlace de conexión.' : 'Este espacio no existe. Abre tu enlace privado completo en ambos PCs.',
     409: 'Este archivo ya existe con otro contenido. Vuelve a seleccionarlo para enviarlo.',
+    410: 'Este archivo fue eliminado del espacio compartido.',
     413: file ? 'Cada archivo puede ocupar hasta 250 MB.' : 'El texto es demasiado grande para este envío.',
     429: 'El servidor está temporalmente ocupado. Inténtalo de nuevo.',
   };
@@ -353,6 +359,20 @@ export async function completeFileUpload(topic, id, fetcher = fetch) {
   return event;
 }
 
+export async function deleteSharedFile(topic, id, envelope, fetcher = fetch) {
+  fileId(id);
+  if (typeof envelope !== 'string' || !envelope || envelope.length > MAX_ENVELOPE_BYTES) {
+    throw new RelayError('Los datos de eliminación del archivo no son válidos.');
+  }
+  const event = await requestJSON(roomURL(topic, `files/${id}/delete`), {
+    method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: envelope,
+  }, fetcher, { timeout: 120000, file: true });
+  if (!backendEvent(event) || (event.cleanupPending !== undefined && typeof event.cleanupPending !== 'boolean')) {
+    throw new RelayError('No se pudo confirmar la eliminación del archivo.', true);
+  }
+  return event;
+}
+
 async function downloadBinary(url, maxBytes, fetcher) {
   let response;
   try {
@@ -438,6 +458,10 @@ export function loadFiles(topic, cursors = {}, fetcher = fetch) {
 
 export function loadArchives(topic, cursors = {}, fetcher = fetch) {
   return loadCatalog(topic, 'archives', cursors, fetcher);
+}
+
+export function loadFileDeletions(topic, cursors = {}, fetcher = fetch) {
+  return loadCatalog(topic, 'file-deletions', cursors, fetcher);
 }
 
 // WebSockets carry only live updates. onSync triggers gap recovery over paginated HTTP.

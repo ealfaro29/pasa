@@ -1,4 +1,4 @@
-import { FILE_CHUNK_BYTES, decryptFile, decryptFileChunk, downloadFile, downloadFilePart } from './protocol.js?v=3.2.0';
+import { FILE_CHUNK_BYTES, decryptFile, decryptFileChunk, downloadFile, downloadFilePart } from './protocol.js?v=3.3.0';
 
 const TEXT_EXTENSIONS = new Set(['txt', 'md', 'json', 'csv', 'tsv', 'log', 'xml', 'html', 'htm', 'css', 'js', 'ts', 'jsx', 'tsx', 'yaml', 'yml', 'py', 'sql', 'gcode', 'ini', 'toml', 'svg']);
 const IMAGE_TYPES = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif', avif: 'image/avif', bmp: 'image/bmp' };

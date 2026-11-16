@@ -7,6 +7,7 @@ import {
   envelopeFromEvent, RelayError, subscribe, loadHistory,
   encryptFile, decryptFile, uploadFile, downloadFile, loadFiles, loadArchives, publishArchiveEnvelope,
   encryptFileChunk, decryptFileChunk, startFileUpload, uploadFilePart, completeFileUpload, downloadFilePart,
+  deleteSharedFile, loadFileDeletions,
 } from '../protocol.js';
 import { API_ORIGIN } from '../config.js';
 
@@ -695,4 +696,128 @@ test('downloads encrypted parts with an 8 MiB cap even when Content-Length under
   await assert.rejects(downloadFilePart(topic, id, 32, noFetch));
   await assert.rejects(downloadFilePart(topic, '../private', 0, noFetch));
   await assert.rejects(downloadFilePart(topic, id, 0, async () => new Response('', { status: 404 })), error => error.status === 404);
+});
+
+test('authenticates individual file deletion events and rejects invalid deletion targets', async () => {
+  const { key } = await createRoom(newSecret());
+  const original = message('', { kind: 'file-delete', target: { id: crypto.randomUUID() } });
+  const envelope = await encryptMessage(key, original);
+  assert.deepEqual(await decryptMessage(key, envelope), original);
+  assert.ok(!envelope.includes(original.target.id));
+  const invalid = [
+    { ...original, text: 'Eliminar este archivo' },
+    ...[undefined, null, {}, { id: '' }, { id: '../file' }, { id: 5 },
+      { id: original.target.id.toUpperCase() }, { id: 'a'.repeat(36) },
+      { id: 'message-id-123456' }].map(target => ({ ...original, target })),
+    { ...original, kind: 'file-deleted' },
+    { ...original, created: Date.now() + 6 * 60_000 },
+  ];
+  for (const payload of invalid) {
+    assert.throws(() => validateMessage(payload));
+    await assert.rejects(encryptMessage(key, payload));
+    await assert.rejects(decryptMessage(key, await sealRaw(key, payload)));
+  }
+});
+
+test('sends encrypted individual deletion envelopes without cookies and validates cleanup confirmations', async () => {
+  const { key } = await createRoom(newSecret());
+  const id = crypto.randomUUID();
+  const envelope = await encryptMessage(key, message('', { kind: 'file-delete', target: { id } }));
+  for (const cleanupPending of [undefined, false, true]) {
+    const confirmation = { ...event(42, envelope), ...(cleanupPending === undefined ? {} : { cleanupPending }) };
+    const result = await deleteSharedFile(topic, id, envelope, async (url, options) => {
+      assert.equal(url, `${API_ORIGIN}/api/rooms/${topic}/files/${id}/delete`);
+      assert.equal(options.method, 'POST');
+      assert.deepEqual(options.headers, { 'Content-Type': 'text/plain' });
+      assert.equal(options.body, envelope);
+      assert.equal(options.credentials, 'omit');
+      assert.equal(options.referrerPolicy, 'no-referrer');
+      assert.equal(options.cache, 'no-store');
+      assert.ok(options.signal instanceof AbortSignal);
+      return Response.json(confirmation);
+    });
+    assert.deepEqual(result, confirmation);
+  }
+  const noFetch = () => assert.fail('Invalid deletion must never contact backend');
+  for (const invalidId of ['../private', id.toUpperCase(), '', null]) await assert.rejects(deleteSharedFile(topic, invalidId, envelope, noFetch));
+  for (const invalidEnvelope of ['', null, {}, 'x'.repeat(MAX_ENVELOPE_BYTES + 1)]) await assert.rejects(deleteSharedFile(topic, id, invalidEnvelope, noFetch));
+  await assert.rejects(deleteSharedFile('invalid-room', id, envelope, noFetch));
+});
+
+test('reports uncertain deletion confirmations as retryable and preserves concrete backend errors', async () => {
+  const id = crypto.randomUUID();
+  const retryable = error => error instanceof RelayError && error.retryable === true;
+  for (const confirmation of [null, { event: 'open' }, { ...event(1), id: 'wrong' },
+    ...[null, 'true', 1, {}].map(cleanupPending => ({ ...event(1), cleanupPending }))]) {
+    await assert.rejects(deleteSharedFile(topic, id, 'encrypted', async () => Response.json(confirmation)), retryable);
+  }
+  await assert.rejects(deleteSharedFile(topic, id, 'encrypted', async () => { throw new TypeError('network down'); }), retryable);
+  await assert.rejects(deleteSharedFile(topic, id, 'encrypted', async () => new Response('not json')), retryable);
+  await assert.rejects(deleteSharedFile(topic, id, 'encrypted', async () => new Response(null)), retryable);
+  await assert.rejects(deleteSharedFile(topic, id, 'encrypted', async () => new Response(new ReadableStream({
+    start(controller) { controller.error(new TypeError('stream interrupted')); },
+  }))), retryable);
+  for (const [status, expectedRetry] of [[400, false], [404, false], [409, false], [429, true], [500, true], [503, true]]) {
+    await assert.rejects(deleteSharedFile(topic, id, 'encrypted', async () => new Response('', { status })), error => {
+      assert.ok(error instanceof RelayError);
+      assert.equal(error.status, status);
+      assert.equal(error.retryable, expectedRetry);
+      return true;
+    });
+  }
+  let cancelled = false;
+  await assert.rejects(deleteSharedFile(topic, id, 'encrypted', async () => new Response(new ReadableStream({
+    start(controller) { controller.enqueue(new Uint8Array(4 * 1024 * 1024 + 1)); },
+    cancel() { cancelled = true; },
+  }), { headers: { 'Content-Length': '1' } })), /demasiado grande/);
+  assert.equal(cancelled, true);
+});
+
+test('loads paginated durable deletion events from their owned catalog with existing history privacy and bounds', async () => {
+  const calls = [];
+  const fetcher = async (url, options) => {
+    calls.push({ url: new URL(url), options });
+    const forward = new URL(url).searchParams.has('after');
+    return Response.json(forward
+      ? page({ messages: [event(3), event(4)], nextAfter: 4, latestSeq: 7, hasMore: true })
+      : page({ messages: [event(2), event(1)], nextBefore: 1, latestSeq: 7, hasMore: true }));
+  };
+  assert.deepEqual((await loadFileDeletions(topic, {}, fetcher)).messages.map(value => value.seq), [2, 1]);
+  assert.equal((await loadFileDeletions(topic, { before: 20, limit: 12 }, fetcher)).nextBefore, 1);
+  assert.equal((await loadFileDeletions(topic, { after: 2, limit: 50 }, fetcher)).nextAfter, 4);
+  assert.equal(calls[0].url.pathname, `/api/rooms/${topic}/file-deletions`);
+  assert.equal(calls[0].url.searchParams.get('limit'), '30');
+  assert.equal(calls[1].url.searchParams.get('before'), '20');
+  assert.equal(calls[1].url.searchParams.get('limit'), '12');
+  assert.equal(calls[2].url.searchParams.get('after'), '2');
+  for (const { options } of calls) {
+    assert.equal(options.method, 'GET');
+    assert.equal(options.credentials, 'omit');
+    assert.equal(options.referrerPolicy, 'no-referrer');
+    assert.equal(options.cache, 'no-store');
+    assert.ok(options.signal instanceof AbortSignal);
+  }
+  const noFetch = () => assert.fail('Invalid cursor must never contact backend');
+  for (const args of [{ before: 0 }, { after: -1 }, { before: 5, after: 2 }, { after: '2' }]) await assert.rejects(loadFileDeletions(topic, args, noFetch));
+  for (const invalidPage of [null, {}, page({ messages: [event(0)] }), page({ hasMore: 'yes' }), page({ latestSeq: -1 })]) {
+    await assert.rejects(loadFileDeletions(topic, {}, async () => Response.json(invalidPage)), error => error instanceof RelayError && error.retryable);
+  }
+});
+
+test('reports tombstoned file downloads and upload replays as gone without retrying', async () => {
+  const id = crypto.randomUUID();
+  const gone = async () => new Response('', { status: 410 });
+  const checkGone = error => {
+    assert.ok(error instanceof RelayError);
+    assert.equal(error.status, 410);
+    assert.equal(error.retryable, false);
+    assert.equal(error.message, 'Este archivo fue eliminado del espacio compartido.');
+    return true;
+  };
+  await assert.rejects(downloadFile(topic, id, gone), checkGone);
+  await assert.rejects(downloadFilePart(topic, id, 0, gone), checkGone);
+  await assert.rejects(startFileUpload(topic, id, 'encrypted metadata', 1, 28, gone), checkGone);
+  await assert.rejects(uploadFilePart(topic, id, 0, new Uint8Array(28), gone), checkGone);
+  const deletion = event(51, 'original encrypted deletion');
+  assert.deepEqual(await deleteSharedFile(topic, id, 'new encrypted deletion retry', async () => Response.json(deletion)), deletion);
 });

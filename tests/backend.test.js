@@ -74,7 +74,7 @@ test('health identifies the own backend without revealing room configuration', a
   const env = { ROOM_IDS: ROOM };
   const response = await worker.fetch(new Request('https://pasa-api.example/health', { headers: { Origin: ORIGIN } }), env);
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { status: 'ok', version: 'pasa-own-v3.1' });
+  assert.deepEqual(await response.json(), { status: 'ok', version: 'pasa-own-v3.3' });
   assert.equal(response.headers.get('Access-Control-Allow-Origin'), ORIGIN);
   assert.equal(response.headers.get('Cache-Control'), 'no-store');
 });
@@ -711,4 +711,268 @@ test('failed cleanup retains its claim and schedules a bounded retry', async t =
   await app.room.alarm();
   assert.equal(bucket.objects.size, 0);
   assert.equal(app.db.prepare('SELECT COUNT(*) AS n FROM file_uploads').get().n, 0);
+});
+
+function deleteFile(id = FILE_ID, metadata = envelope('D'.repeat(64))) {
+  return request(`files/${id}/delete`, { method: 'POST', body: metadata, headers: { 'Content-Type': 'text/plain' } });
+}
+
+async function committedChunkFile(app, id = FILE_ID, metadata = envelope(), bytes = new Uint8Array(28)) {
+  assert.equal((await app.room.fetch(startFile({ id, metadata, bytes: bytes.length }))).status, 200);
+  assert.equal((await app.room.fetch(filePart(0, bytes, id))).status, 200);
+  const response = await app.room.fetch(completeFile(id));
+  assert.equal(response.status, 200);
+  return response.json();
+}
+
+test('deleting a legacy file atomically removes bytes and original metadata while retaining the deletion event', async t => {
+  const app = setup(); t.after(() => app.db.close());
+  app.db.exec('PRAGMA foreign_keys = ON');
+  const original = await (await app.room.fetch(upload(new Uint8Array(400000), envelope()))).json();
+  // A stale category marker cannot prevent physical removal through a foreign key.
+  app.db.prepare('INSERT INTO archive_messages (seq) VALUES (?)').run(original.seq);
+  const text = await (await app.room.fetch(post(envelope('T'.repeat(64))))).json();
+  const response = await app.room.fetch(deleteFile());
+  assert.equal(response.status, 200);
+  const deleted = await response.json();
+  assert.equal(deleted.event, 'message');
+  assert.equal(deleted.message, envelope('D'.repeat(64)));
+  assert.ok(deleted.seq > text.seq);
+  assert.deepEqual(app.sent.at(-1), deleted);
+  for (const table of ['files', 'file_chunks', 'file_uploads', 'uploaded_parts', 'archive_messages']) assert.equal(app.db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n, 0, table);
+  assert.equal(app.db.prepare('SELECT COUNT(*) AS n FROM messages WHERE seq = ?').get(original.seq).n, 0);
+  assert.equal(app.db.prepare('SELECT COUNT(*) AS n FROM messages').get().n, 2, 'unrelated text and encrypted deletion event remain');
+  assert.equal((await app.room.fetch(request(`files/${FILE_ID}`))).status, 410);
+  assert.equal((await (await app.room.fetch(request('files'))).json()).messages.length, 0);
+  const restored = new PasaRoom(app.ctx, app.env);
+  assert.deepEqual(await (await restored.fetch(deleteFile(FILE_ID, envelope('E'.repeat(64))))).json(), deleted);
+  assert.equal(app.sent.filter(event => event.seq === deleted.seq).length, 1);
+  assert.deepEqual((await (await restored.fetch(request('file-deletions'))).json()).messages, [deleted]);
+});
+
+test('chunked deletion purges the exact R2 prefix and every orphan while preserving other shared files', async t => {
+  const app = setup(); t.after(() => app.db.close());
+  app.db.exec('PRAGMA foreign_keys = ON');
+  const bucket = fileBucket(); app.env.FILES = bucket;
+  const original = await committedChunkFile(app);
+  const otherId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  const other = await committedChunkFile(app, otherId, envelope('B'.repeat(64)), new Uint8Array(28).fill(8));
+  bucket.objects.set(`${ROOM}/${FILE_ID}/unindexed-orphan`, { size: 28, bytes: new Uint8Array(28) });
+  const originalList = bucket.list.bind(bucket);
+  bucket.list = async options => {
+    assert.ok(app.sent.some(event => event.message === envelope('D'.repeat(64))), 'logical deletion is durably broadcast before physical R2 cleanup');
+    assert.equal((await app.room.fetch(request(`files/${FILE_ID}/parts/0`))).status, 410);
+    return originalList(options);
+  };
+  const deleted = await (await app.room.fetch(deleteFile())).json();
+  assert.ok(!deleted.cleanupPending);
+  assert.ok(![...bucket.objects.keys()].some(key => key.startsWith(`${ROOM}/${FILE_ID}/`)));
+  assert.equal(bucket.objects.size, 1);
+  assert.equal((await app.room.fetch(request(`files/${otherId}/parts/0`))).status, 200);
+  assert.deepEqual((await (await app.room.fetch(request('files'))).json()).messages.map(event => event.seq), [other.seq]);
+  assert.equal(app.db.prepare('SELECT COUNT(*) AS n FROM messages WHERE seq = ?').get(original.seq).n, 0);
+  assert.equal(app.db.prepare('SELECT COUNT(*) AS n FROM file_uploads WHERE id = ?').get(FILE_ID).n, 0);
+  assert.equal(app.db.prepare('SELECT COUNT(*) AS n FROM uploaded_parts WHERE file_id = ?').get(FILE_ID).n, 0);
+  assert.equal(app.db.prepare('SELECT cleanup_passes FROM file_deletions WHERE id = ?').get(FILE_ID).cleanup_passes, 1);
+});
+
+test('file tombstones prevent legacy, chunked, and cached-ciphertext resurrection', async t => {
+  const app = setup(); t.after(() => app.db.close());
+  app.env.FILES = fileBucket();
+  const original = envelope();
+  await app.room.fetch(upload(new Uint8Array(28), original));
+  assert.equal((await app.room.fetch(deleteFile())).status, 200);
+  for (const req of [request(`files/${FILE_ID}`), request(`files/${FILE_ID}/parts/0`), startFile(), filePart(0, new Uint8Array(28)), completeFile(), upload(), post(original), request('archives', { method: 'POST', body: original })]) {
+    assert.equal((await app.room.fetch(req)).status, 410);
+  }
+  assert.equal(app.db.prepare('SELECT COUNT(*) AS n FROM files').get().n, 0);
+  assert.equal(app.db.prepare('SELECT COUNT(*) AS n FROM messages').get().n, 1);
+  const unknown = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  assert.equal((await app.room.fetch(deleteFile(unknown, envelope('U'.repeat(64))))).status, 200);
+  assert.equal((await app.room.fetch(startFile({ id: unknown, metadata: envelope('N'.repeat(64)) }))).status, 410, 'a deletion racing a future start still wins');
+});
+
+test('deletion refuses the original metadata envelope instead of deduplicating away its own event', async t => {
+  const app = setup(); t.after(() => app.db.close());
+  const original = await (await app.room.fetch(upload())).json();
+  assert.equal((await app.room.fetch(deleteFile(FILE_ID, original.message))).status, 400);
+  assert.equal((await app.room.fetch(request(`files/${FILE_ID}`))).status, 200);
+  assert.equal(app.db.prepare('SELECT COUNT(*) AS n FROM file_deletions').get().n, 0);
+  assert.equal(app.db.prepare('SELECT COUNT(*) AS n FROM messages').get().n, 1);
+});
+
+test('temporary R2 deletion failure returns logical success and alarms finish cleanup without restoring access', async t => {
+  const app = setup(); t.after(() => app.db.close());
+  let now = Date.now(); t.mock.method(Date, 'now', () => now);
+  const bucket = fileBucket(); app.env.FILES = bucket;
+  await committedChunkFile(app);
+  const originalDelete = bucket.delete.bind(bucket);
+  bucket.delete = async () => { throw new Error('temporary R2 failure'); };
+  const response = await app.room.fetch(deleteFile());
+  assert.equal(response.status, 200);
+  const deleted = await response.json();
+  assert.equal(deleted.cleanupPending, true);
+  assert.equal(bucket.objects.size, 1);
+  assert.equal((await app.room.fetch(request(`files/${FILE_ID}/parts/0`))).status, 410);
+  assert.equal(app.db.prepare('SELECT COUNT(*) AS n FROM files').get().n, 0);
+  assert.ok((await app.ctx.storage.getAlarm()) > now && (await app.ctx.storage.getAlarm()) <= now + 60000);
+  bucket.delete = originalDelete;
+  now += 60000;
+  await app.ctx.storage.deleteAlarm();
+  await app.room.alarm();
+  assert.equal(bucket.objects.size, 0);
+  assert.equal(app.db.prepare('SELECT cleanup_passes FROM file_deletions WHERE id = ?').get(FILE_ID).cleanup_passes, 1);
+  // The delayed final pass catches an orphan from an already in-flight request.
+  bucket.objects.set(`${ROOM}/${FILE_ID}/late-orphan`, { size: 28, bytes: new Uint8Array(28) });
+  now += 86400000;
+  await app.ctx.storage.deleteAlarm();
+  await app.room.alarm();
+  assert.equal(bucket.objects.size, 0);
+  assert.equal(app.db.prepare('SELECT cleanup_due FROM file_deletions WHERE id = ?').get(FILE_ID).cleanup_due, -1);
+  assert.equal(await app.ctx.storage.getAlarm(), null);
+  const repeated = await (await app.room.fetch(deleteFile(FILE_ID, envelope('E'.repeat(64))))).json();
+  assert.equal(repeated.seq, deleted.seq);
+  assert.ok(!repeated.cleanupPending);
+  assert.equal(app.sent.filter(event => event.seq === deleted.seq).length, 1);
+});
+
+test('deletion racing an in-flight chunk write blocks commit and removes the late object', async t => {
+  const app = setup(); t.after(() => app.db.close());
+  const bucket = fileBucket(); app.env.FILES = bucket;
+  await app.room.fetch(startFile());
+  let release;
+  let entered;
+  const gate = new Promise(resolve => { release = resolve; });
+  const waiting = new Promise(resolve => { entered = resolve; });
+  const originalPut = bucket.put.bind(bucket);
+  bucket.put = async (...args) => { entered(); await gate; return originalPut(...args); };
+  const pending = app.room.fetch(filePart(0, new Uint8Array(28)));
+  await waiting;
+  const response = await app.room.fetch(deleteFile());
+  assert.equal(response.status, 200);
+  const deleted = await response.json();
+  release();
+  assert.equal((await pending).status, 410);
+  assert.equal(bucket.objects.size, 0);
+  assert.equal((await app.room.fetch(completeFile())).status, 410);
+  assert.deepEqual(app.sent.map(event => event.seq), [deleted.seq]);
+  assert.equal(app.db.prepare('SELECT COUNT(*) AS n FROM messages').get().n, 1);
+});
+
+test('deletion racing a pending download prevents the already-fetched R2 body from being returned', async t => {
+  const app = setup(); t.after(() => app.db.close());
+  const bucket = fileBucket(); app.env.FILES = bucket;
+  await committedChunkFile(app);
+  let release;
+  let entered;
+  let cancelled = false;
+  const gate = new Promise(resolve => { release = resolve; });
+  const waiting = new Promise(resolve => { entered = resolve; });
+  bucket.get = async () => {
+    entered(); await gate;
+    return { size: 28, body: new ReadableStream({ cancel() { cancelled = true; } }) };
+  };
+  const pending = app.room.fetch(request(`files/${FILE_ID}/parts/0`));
+  await waiting;
+  assert.equal((await app.room.fetch(deleteFile())).status, 200);
+  release();
+  assert.equal((await pending).status, 410);
+  assert.equal(cancelled, true);
+});
+
+test('deletion racing a durable completion does not rebroadcast removed original file metadata', async t => {
+  const app = setup(); t.after(() => app.db.close());
+  app.env.FILES = fileBucket();
+  await app.room.fetch(startFile());
+  await app.room.fetch(filePart(0, new Uint8Array(28)));
+  let release;
+  let entered;
+  let blockNext = true;
+  const gate = new Promise(resolve => { release = resolve; });
+  const waiting = new Promise(resolve => { entered = resolve; });
+  const originalSync = app.ctx.storage.sync;
+  app.ctx.storage.sync = async () => {
+    await originalSync();
+    if (blockNext) { blockNext = false; entered(); await gate; }
+  };
+  const completing = app.room.fetch(completeFile());
+  await waiting;
+  const deleted = await (await app.room.fetch(deleteFile())).json();
+  release();
+  assert.equal((await completing).status, 410);
+  assert.deepEqual(app.sent.map(event => event.seq), [deleted.seq]);
+  assert.equal((await (await app.room.fetch(request('files'))).json()).messages.length, 0);
+});
+
+test('file-deletion catalogs and general cursors retain progress across removed file-message sequence gaps', async t => {
+  const app = setup(); t.after(() => app.db.close());
+  const deleted = [];
+  const texts = [];
+  for (let index = 0; index < 7; index++) {
+    const id = `${String(index).padStart(8, '0')}-aaaa-aaaa-aaaa-aaaaaaaaaaaa`;
+    await app.room.fetch(upload(new Uint8Array(28), envelope('F'.repeat(64 + index)), id));
+    texts.push(await (await app.room.fetch(post(envelope('T'.repeat(64 + index))))).json());
+    deleted.push(await (await app.room.fetch(deleteFile(id, envelope('D'.repeat(64 + index))))).json());
+  }
+  const latest = await (await app.room.fetch(request('file-deletions?limit=3'))).json();
+  assert.deepEqual(latest.messages.map(event => event.seq), deleted.slice(-3).reverse().map(event => event.seq));
+  assert.equal(latest.hasMore, true);
+  const older = await (await app.room.fetch(request(`file-deletions?before=${latest.nextBefore}&limit=50`))).json();
+  assert.deepEqual(older.messages.map(event => event.seq), deleted.slice(0, -3).reverse().map(event => event.seq));
+  const forward = await (await app.room.fetch(request(`file-deletions?after=${deleted[2].seq}&limit=50`))).json();
+  assert.deepEqual(forward.messages.map(event => event.seq), deleted.slice(3).map(event => event.seq));
+  const all = [];
+  let after = 0;
+  do {
+    const page = await (await app.room.fetch(request(`messages?after=${after}&limit=3`))).json();
+    all.push(...page.messages.map(event => event.seq));
+    after = page.nextAfter;
+    if (!page.hasMore) break;
+  } while (all.length < 30);
+  assert.deepEqual(all, texts.flatMap((event, index) => [event.seq, deleted[index].seq]));
+  assert.equal(after, deleted.at(-1).seq);
+});
+
+test('deletion routes enforce existing room, origin, body, method and cursor bounds', async t => {
+  const app = setup(); t.after(() => app.db.close());
+  const denied = new Request(`https://pasa-api.example/api/rooms/${OTHER_ROOM}/files/${FILE_ID}/delete`, { method: 'POST', body: envelope() });
+  assert.equal((await worker.fetch(denied, app.env)).status, 404);
+  assert.equal((await worker.fetch(request(`files/${FILE_ID}/delete`, { method: 'POST', body: envelope(), headers: { Origin: 'https://evil.example' } }), app.env)).status, 403);
+  assert.equal((await worker.fetch(request(`files/${FILE_ID}/delete`), app.env)).status, 405);
+  assert.equal((await worker.fetch(request(`files/${FILE_ID}/delete`, { method: 'DELETE' }), app.env)).status, 405);
+  assert.equal((await worker.fetch(request(`files/${FILE_ID}/delete`, { method: 'POST', body: 'plaintext' }), app.env)).status, 400);
+  assert.equal((await worker.fetch(request(`files/${FILE_ID}/delete`, { method: 'POST', body: envelope(), headers: { 'Content-Type': 'text/html' } }), app.env)).status, 415);
+  assert.equal((await worker.fetch(request('file-deletions', { method: 'POST', body: envelope() }), app.env)).status, 405);
+  assert.equal((await worker.fetch(request('file-deletions?after=-1'), app.env)).status, 400);
+  assert.equal((await worker.fetch(request(`file-deletions/${FILE_ID}`), app.env)).status, 404);
+  assert.equal(app.db.prepare('SELECT COUNT(*) AS n FROM file_deletions').get().n, 0);
+});
+
+test('a failed deletion transaction leaves the original file intact and exposes no deletion event', async t => {
+  const app = setup(); t.after(() => app.db.close());
+  await app.room.fetch(upload());
+  const originalExec = app.ctx.storage.sql.exec;
+  app.ctx.storage.sql.exec = (query, ...args) => {
+    if (query.startsWith('DELETE FROM files')) throw new Error('storage failure');
+    return originalExec(query, ...args);
+  };
+  const response = await app.room.fetch(deleteFile());
+  assert.equal(response.status, 500);
+  assert.equal(app.db.prepare('SELECT COUNT(*) AS n FROM file_deletions').get().n, 0);
+  assert.equal(app.db.prepare('SELECT COUNT(*) AS n FROM messages').get().n, 1);
+  assert.equal((await app.room.fetch(request(`files/${FILE_ID}`))).status, 200);
+  assert.equal(app.sent.length, 1);
+});
+
+test('a new deletion cannot reuse an already-seen text or archive sequence', async t => {
+  const app = setup(); t.after(() => app.db.close());
+  await app.room.fetch(upload());
+  const oldText = envelope('T'.repeat(64));
+  const oldArchive = envelope('R'.repeat(64));
+  await app.room.fetch(post(oldText));
+  await app.room.fetch(request('archives', { method: 'POST', body: oldArchive }));
+  for (const oldEnvelope of [oldText, oldArchive]) assert.equal((await app.room.fetch(deleteFile(FILE_ID, oldEnvelope))).status, 409);
+  assert.equal(app.db.prepare('SELECT COUNT(*) AS n FROM file_deletions').get().n, 0);
+  assert.equal((await app.room.fetch(request(`files/${FILE_ID}`))).status, 200);
+  assert.equal((await app.room.fetch(deleteFile())).status, 200);
 });

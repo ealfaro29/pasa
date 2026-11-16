@@ -9,8 +9,8 @@
     <meta name="description" content="Comparte texto, links y archivos entre tus equipos. Un mismo enlace, sin registro." />
     <title>pasa — De un PC al otro</title>
     <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="./styles.css?v=3.2.0" />
-    <script type="module" src="./app.js?v=3.2.0"></script>
+    <link rel="stylesheet" href="./styles.css?v=3.3.0" />
+    <script type="module" src="./app.js?v=3.3.0"></script>
   </head>
   <body>
     <noscript><p class="noscript-message">Activa JavaScript para conectar tus PCs y compartir texto y links.</p></noscript>
@@ -27,6 +27,7 @@
       <symbol id="icon-upload" viewBox="0 0 24 24"><path d="M12 16V4m-5 5 5-5 5 5M4 16v5h16v-5"/></symbol>
       <symbol id="icon-eye" viewBox="0 0 24 24"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12"/><circle cx="12" cy="12" r="3"/></symbol>
       <symbol id="icon-cube" viewBox="0 0 24 24"><path d="m12 2 9 5v10l-9 5-9-5V7zm0 10 9-5M12 12 3 7m9 5v10"/></symbol>
+      <symbol id="icon-trash" viewBox="0 0 24 24"><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7m4-7v7"/></symbol>
     </svg>
 
     <div class="app-shell">
@@ -150,6 +151,15 @@
         <span id="viewer-hint" class="viewer-hint" hidden>Arrastra para girar · Rueda o pellizca para acercar</span>
         <button id="viewer-download" class="button button-primary" type="button"><svg class="icon" aria-hidden="true"><use href="#icon-download"/></svg>Descargar</button>
       </footer>
+    </dialog>
+
+    <dialog id="delete-file-dialog" class="room-dialog delete-file-dialog" aria-labelledby="delete-file-title" aria-describedby="delete-file-description">
+      <div class="dialog-delete-icon" aria-hidden="true"><svg class="icon"><use href="#icon-trash"/></svg></div>
+      <h2 id="delete-file-title">¿Eliminar este archivo?</h2>
+      <p id="delete-file-name" class="delete-file-name"></p>
+      <p id="delete-file-description">Se borrará para todas las personas de este espacio. Esta acción no se puede deshacer.</p>
+      <p id="delete-file-error" class="delete-file-error" role="alert"></p>
+      <div class="delete-dialog-actions"><button id="cancel-file-delete" class="button button-secondary" type="button" autofocus>Cancelar</button><button id="confirm-file-delete" class="button button-danger" type="button">Eliminar definitivamente</button></div>
     </dialog>
 
     <dialog id="room-dialog" class="room-dialog" aria-labelledby="room-title">

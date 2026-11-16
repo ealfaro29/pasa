@@ -36,7 +36,7 @@ test('whole text messages move between views and typed file/control events never
   const state = archived(value.id);
   assert.equal(messageView(value, state, false), null);
   assert.equal(messageView(value, state, true).text, 'Una idea');
-  for (const kind of ['file', 'archive']) assert.equal(messageView({ ...value, kind }, state, true), null);
+  for (const kind of ['file', 'file-delete', 'archive']) assert.equal(messageView({ ...value, kind }, state, true), null);
 });
 
 test('link-only messages copy visible links once and keep balanced URL punctuation', () => {

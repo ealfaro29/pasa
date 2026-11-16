@@ -1,4 +1,4 @@
-import { previewType } from './file-content.js?v=3.2.0';
+import { previewType } from './file-content.js?v=3.3.0';
 
 const $ = id => document.getElementById(id);
 const TEXT_PREVIEW_BYTES = 256 * 1024;
@@ -65,7 +65,7 @@ export class FileViewer {
       this.blob = blob;
       if (type.kind === 'model') {
         $('viewer-status').textContent = 'Preparando modelo 3D…';
-        const [{ mountModel }, bytes] = await Promise.all([import('./vendor/model-viewer.js?v=3.2.0'), blob.arrayBuffer()]);
+        const [{ mountModel }, bytes] = await Promise.all([import('./vendor/model-viewer.js?v=3.3.0'), blob.arrayBuffer()]);
         if (!current()) return;
         const model = await mountModel(this.viewport, bytes, type.extension, { signal: this.controller.signal, onError: error => {
           if (!current()) return;
