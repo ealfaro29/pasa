@@ -1,5 +1,5 @@
-import { API_ORIGIN } from './config.js?v=3.1.0';
-import { describeLink } from './links.js?v=3.1.0';
+import { API_ORIGIN } from './config.js?v=3.2.0';
+import { describeLink } from './links.js?v=3.2.0';
 
 const CACHE_MS = 24 * 60 * 60 * 1000;
 const NEGATIVE_CACHE_MS = 10 * 60 * 1000;

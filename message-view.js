@@ -1,4 +1,4 @@
-import { extractLinks } from './links.js?v=3.1.0';
+import { extractLinks } from './links.js?v=3.2.0';
 
 // Remove every spelling of a hidden URL, including canonical duplicates, while
 // preserving prose and the punctuation surrounding a pasted link.

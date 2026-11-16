@@ -1,4 +1,6 @@
-import { MAX_FILE_BYTES, FILE_CHUNK_BYTES, encryptFileChunk, decryptFileChunk, decryptFile, encryptMessage, startFileUpload, uploadFilePart, completeFileUpload, downloadFilePart, downloadFile, loadFiles } from './protocol.js?v=3.1.0';
+import { MAX_FILE_BYTES, FILE_CHUNK_BYTES, encryptFileChunk, encryptMessage, startFileUpload, uploadFilePart, completeFileUpload, loadFiles } from './protocol.js?v=3.2.0';
+import { previewType, readSharedFile } from './file-content.js?v=3.2.0';
+import { FileViewer } from './file-viewer.js?v=3.2.0';
 
 const $ = id => document.getElementById(id);
 const formatSize = size => size < 1024 ? `${size} B` : size < 1024 * 1024 ? `${(size / 1024).toLocaleString('es', { maximumFractionDigits: 1 })} KB` : `${(size / 1024 / 1024).toLocaleString('es', { maximumFractionDigits: 1 })} MB`;
@@ -13,6 +15,7 @@ export class FileShelf {
     this.hasMore = false;
     this.loading = false;
     this.uploading = false;
+    this.viewer = new FileViewer({ read: (message, options) => readSharedFile(this.room, message, options), download: message => this.download(message) });
     $('choose-files').addEventListener('click', () => $('file-input').click());
     $('file-input').addEventListener('change', () => {
       this.addFiles([...$('file-input').files]);
@@ -148,18 +151,9 @@ export class FileShelf {
     this.downloading.add(message.id);
     this.render();
     try {
-      const parts = [];
-      if (message.file.format === 'chunks-v1') {
-        for (let index = 0; index < message.file.chunks; index++) {
-          const encrypted = await downloadFilePart(this.room.topic, message.file.id, index);
-          const expected = Math.min(FILE_CHUNK_BYTES, message.file.size - index * FILE_CHUNK_BYTES);
-          parts.push(new Blob([await decryptFileChunk(this.room.key, message.file.id, index, encrypted, expected)]));
-        }
-      } else {
-        const encrypted = await downloadFile(this.room.topic, message.file.id);
-        parts.push(new Blob([await decryptFile(this.room.key, message.file.id, encrypted, message.file.size)]));
-      }
-      const url = URL.createObjectURL(new Blob(parts, { type: 'application/octet-stream' }));
+      const blob = this.viewer.message?.id === message.id && this.viewer.blob?.size === message.file.size
+        ? this.viewer.blob : await readSharedFile(this.room, message);
+      const url = URL.createObjectURL(blob);
       const anchor = document.createElement('a');
       anchor.href = url;
       anchor.download = message.file.name.replace(/[/\\\u0000-\u001f\u007f]/g, '_');
@@ -214,10 +208,24 @@ export class FileShelf {
       button.type = 'button';
       button.className = 'copy-message download-file';
       button.disabled = !this.room || this.downloading.has(message.id);
-      button.append(this.icon('download'), document.createTextNode(button.disabled ? 'Descargando…' : 'Descargar'));
+      button.append(this.icon('download'), document.createTextNode(this.downloading.has(message.id) ? 'Descargando…' : 'Descargar'));
       button.setAttribute('aria-label', `Descargar ${message.file.name}`);
       button.addEventListener('click', () => this.download(message));
-      row.append(this.icon('file'), info, button);
+      const actions = document.createElement('div');
+      actions.className = 'file-actions';
+      const type = previewType(message.file);
+      if (type) {
+        const preview = document.createElement('button');
+        preview.type = 'button';
+        preview.className = 'copy-message preview-file';
+        preview.disabled = !this.room;
+        preview.append(this.icon(type.kind === 'model' ? 'cube' : 'eye'), document.createTextNode(type.kind === 'model' ? 'Ver 3D' : 'Ver'));
+        preview.setAttribute('aria-label', `Ver ${message.file.name}`);
+        preview.addEventListener('click', () => this.viewer.open(message));
+        actions.append(preview);
+      }
+      actions.append(button);
+      row.append(this.icon('file'), info, actions);
       fragment.append(row);
     }
     list.replaceChildren(fragment);

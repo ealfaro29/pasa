@@ -5,12 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#f5f5f0" />
     <meta name="referrer" content="no-referrer" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' https://pasa-api.sentient-proposal-comments.workers.dev wss://pasa-api.sentient-proposal-comments.workers.dev http://127.0.0.1:8787 ws://127.0.0.1:8787; img-src 'self' data: https://pasa-api.sentient-proposal-comments.workers.dev; object-src 'none'; base-uri 'self'; form-action 'self'" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' https://pasa-api.sentient-proposal-comments.workers.dev wss://pasa-api.sentient-proposal-comments.workers.dev http://127.0.0.1:8787 ws://127.0.0.1:8787; img-src 'self' data: blob: https://pasa-api.sentient-proposal-comments.workers.dev; frame-src blob:; object-src 'none'; base-uri 'self'; form-action 'self'" />
     <meta name="description" content="Comparte texto, links y archivos entre tus equipos. Un mismo enlace, sin registro." />
     <title>pasa — De un PC al otro</title>
     <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="./styles.css?v=3.1.0" />
-    <script type="module" src="./app.js?v=3.1.0"></script>
+    <link rel="stylesheet" href="./styles.css?v=3.2.0" />
+    <script type="module" src="./app.js?v=3.2.0"></script>
   </head>
   <body>
     <noscript><p class="noscript-message">Activa JavaScript para conectar tus PCs y compartir texto y links.</p></noscript>
@@ -25,6 +25,8 @@
       <symbol id="icon-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zm0 0v6h6M8 13h8m-8 4h5"/></symbol>
       <symbol id="icon-download" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5"/></symbol>
       <symbol id="icon-upload" viewBox="0 0 24 24"><path d="M12 16V4m-5 5 5-5 5 5M4 16v5h16v-5"/></symbol>
+      <symbol id="icon-eye" viewBox="0 0 24 24"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12"/><circle cx="12" cy="12" r="3"/></symbol>
+      <symbol id="icon-cube" viewBox="0 0 24 24"><path d="m12 2 9 5v10l-9 5-9-5V7zm0 10 9-5M12 12 3 7m9 5v10"/></symbol>
     </svg>
 
     <div class="app-shell">
@@ -130,6 +132,25 @@
       </main>
       <div class="bottom-note">Menos enviártelo por chat. Más seguir con lo tuyo.</div>
     </div>
+
+    <dialog id="file-viewer" class="file-viewer" aria-labelledby="viewer-title" aria-describedby="viewer-meta">
+      <header class="viewer-header">
+        <div><p class="viewer-eyebrow">VISTA PREVIA</p><h2 id="viewer-title"></h2><p id="viewer-meta"></p></div>
+        <button id="viewer-close" class="viewer-close" type="button" aria-label="Cerrar visor"><svg class="icon" aria-hidden="true"><use href="#icon-close"/></svg></button>
+      </header>
+      <div class="viewer-content">
+        <p id="viewer-status" class="viewer-status" role="status"></p>
+        <div id="viewer-viewport" class="viewer-viewport" aria-label="Contenido del archivo" aria-busy="false"></div>
+      </div>
+      <footer class="viewer-footer">
+        <div id="viewer-model-tools" class="viewer-model-tools" hidden>
+          <button id="viewer-reset" class="copy-message" type="button"><svg class="icon" aria-hidden="true"><use href="#icon-restore"/></svg>Centrar</button>
+          <button id="viewer-wireframe" class="copy-message" type="button" aria-pressed="false"><svg class="icon" aria-hidden="true"><use href="#icon-cube"/></svg>Malla</button>
+        </div>
+        <span id="viewer-hint" class="viewer-hint" hidden>Arrastra para girar · Rueda o pellizca para acercar</span>
+        <button id="viewer-download" class="button button-primary" type="button"><svg class="icon" aria-hidden="true"><use href="#icon-download"/></svg>Descargar</button>
+      </footer>
+    </dialog>
 
     <dialog id="room-dialog" class="room-dialog" aria-labelledby="room-title">
       <form method="dialog"><button id="room-close" class="dialog-close" type="submit" aria-label="Cerrar"><svg class="icon" aria-hidden="true"><use href="#icon-close"/></svg></button></form>

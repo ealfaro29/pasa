@@ -1,8 +1,8 @@
-import { createRoom, decryptMessage, encryptMessage, isRoomSecret, loadHistory, loadArchives, MAX_TEXT_BYTES, publishEnvelope, publishArchiveEnvelope, subscribe } from './protocol.js?v=3.1.0';
-import { createLinkCard, setPreviewContext } from './preview-cards.js?v=3.1.0';
-import { ArchiveState, archiveKey } from './archive-state.js?v=3.1.0';
-import { FileShelf } from './shared-files.js?v=3.1.0';
-import { messageView } from './message-view.js?v=3.1.0';
+import { createRoom, decryptMessage, encryptMessage, isRoomSecret, loadHistory, loadArchives, MAX_TEXT_BYTES, publishEnvelope, publishArchiveEnvelope, subscribe } from './protocol.js?v=3.2.0';
+import { createLinkCard, setPreviewContext } from './preview-cards.js?v=3.2.0';
+import { ArchiveState, archiveKey } from './archive-state.js?v=3.2.0';
+import { FileShelf } from './shared-files.js?v=3.2.0';
+import { messageView } from './message-view.js?v=3.2.0';
 
 const $ = id => document.getElementById(id);
 const input = $('message-input');

@@ -1,5 +1,5 @@
 // Message transport sends ciphertext. The key stays in the URL fragment.
-import { API_ORIGIN } from './config.js?v=3.1.0';
+import { API_ORIGIN } from './config.js?v=3.2.0';
 export const MAX_TEXT_BYTES = 128 * 1024;
 export const MAX_FILE_BYTES = 250 * 1024 * 1024;
 export const FILE_CHUNK_BYTES = 8 * 1024 * 1024;
